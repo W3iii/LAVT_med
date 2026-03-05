@@ -11,13 +11,22 @@ Key differences:
   - No dependency on the REFER API / refcoco splits
 
 Example – single GPU:
-    python train_bc.py \
-        --model lavt \
-        --model_id lavt_bc \
-        --bc_dataset_root ../dataset \
-        --pretrained_swin_weights /path/to/swin_base.pth \
-        --output-dir ./checkpoints/bc \
-        --epochs 40 -b 4
+    python train_bc.py `
+    --model lavt `
+    --model_id lavt_bc `
+    --bc_dataset_root ../dataset `
+    --batch-size 8 `
+    --lr 0.00005 `
+    --wd 1e-2 `
+    --swin_type base `
+    --pretrained_swin_weights ./pretrained_weights/swin_base_patch4_window12_384_22k.pth `
+    --window12 `
+    --epochs 100 `
+    --img_size 384 `
+    --workers 4 `
+    --pin_mem `
+    --output-dir ./checkpoints/bc `
+    2>&1 | Tee-Object -FilePath ./models/lavt_bc/output.log
 
 Example – multi-GPU (torchrun):
     torchrun --nproc_per_node=2 train_bc.py \
@@ -47,7 +56,7 @@ import torchvision
 
 import transforms as T
 import utils
-from bert.modeling_bert import BertModel
+from transformers import BertModel
 from lib import segmentation
 
 
@@ -86,7 +95,7 @@ def get_parser():
     # ── training hyper-params ──
     parser.add_argument('--epochs', default=40, type=int)
     parser.add_argument('-b', '--batch-size', default=4, type=int)
-    parser.add_argument('--img_size', default=480, type=int)
+    parser.add_argument('--img_size', default=384, type=int)
     parser.add_argument('--lr', default=5e-5, type=float)
     parser.add_argument('--wd', '--weight-decay', default=1e-2, type=float,
                         metavar='W', dest='weight_decay')
@@ -285,6 +294,7 @@ def main(args):
         utils.init_distributed_mode(args)
     else:
         os.makedirs(args.output_dir, exist_ok=True)
+        os.makedirs(os.path.join('./models', args.model_id), exist_ok=True)
 
     # ── datasets ─────────────────────────────────────────────────────────
     transform = get_transform(args)

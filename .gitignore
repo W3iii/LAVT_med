@@ -1,0 +1,5 @@
+# pretrained weights
+pretrained_weights/
+*.pth
+*.ckpt
+*.pt
