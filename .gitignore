@@ -3,3 +3,5 @@ pretrained_weights/
 *.pth
 *.ckpt
 *.pt
+*.pyc
+__pycache__/
