@@ -25,7 +25,7 @@ import numpy as np
 import torch
 import torch.utils.data
 
-from bert.modeling_bert import BertModel
+from transformers import BertModel
 from lib import segmentation
 import transforms as T
 import utils
@@ -185,8 +185,7 @@ def main(args):
     # ── BERT ──────────────────────────────────────────────────────────────
     if args.model != 'lavt_one':
         single_bert_model = BertModel.from_pretrained(args.ck_bert)
-        if args.ddp_trained_weights:
-            single_bert_model.pooler = None
+        single_bert_model.pooler = None  # match train_bc.py: pooler is always removed during training
         single_bert_model.load_state_dict(checkpoint['bert_model'])
         bert_model = single_bert_model.to(device)
     else:

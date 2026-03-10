@@ -154,10 +154,20 @@ def get_transform(args):
 
 # ── loss ──────────────────────────────────────────────────────────────────────
 
+def dice_loss(input, target, smooth=1.0):
+    """Soft Dice Loss over the tumour class (class-1 probability)."""
+    prob = torch.softmax(input, dim=1)[:, 1]          # (B, H, W)  tumour prob
+    gt   = target.float()                              # (B, H, W)
+    intersection = (prob * gt).sum(dim=(1, 2))
+    dice = (2.0 * intersection + smooth) / (prob.sum(dim=(1, 2)) + gt.sum(dim=(1, 2)) + smooth)
+    return 1.0 - dice.mean()
+
+
 def criterion(input, target):
-    # slight up-weighting of the tumour class (class 1)
-    weight = torch.FloatTensor([0.9, 1.1]).cuda()
-    return nn.functional.cross_entropy(input, target, weight=weight)
+    """Dice + BCE combination loss – better suited for imbalanced medical segmentation."""
+    bce  = nn.functional.cross_entropy(input, target)
+    dice = dice_loss(input, target)
+    return bce + dice
 
 
 # ── IoU ───────────────────────────────────────────────────────────────────────
