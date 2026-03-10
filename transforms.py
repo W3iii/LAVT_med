@@ -122,3 +122,52 @@ class Normalize(object):
         image = F.normalize(image, mean=self.mean, std=self.std)
         return image, target
 
+
+class RandomBrightnessContrast(object):
+    """
+    Randomly adjust brightness and contrast of a PIL RGB image.
+    Simulates soft-tissue windowing variation in CT scans.
+    Applied before ToTensor.
+    """
+    def __init__(self, brightness=0.2, contrast=0.2, p=0.5):
+        self.brightness = brightness
+        self.contrast   = contrast
+        self.p          = p
+
+    def __call__(self, image, target):
+        if random.random() < self.p:
+            factor = 1.0 + random.uniform(-self.brightness, self.brightness)
+            image  = F.adjust_brightness(image, max(0.0, factor))
+        if random.random() < self.p:
+            factor = 1.0 + random.uniform(-self.contrast, self.contrast)
+            image  = F.adjust_contrast(image, max(0.0, factor))
+        return image, target
+
+
+class RandomGaussianNoise(object):
+    """
+    Add random Gaussian noise to a float tensor image.
+    Applied after ToTensor, before Normalize.
+    Simulates CT acquisition noise.
+    """
+    def __init__(self, std=0.02, p=0.5):
+        self.std = std
+        self.p   = p
+
+    def __call__(self, image, target):
+        if random.random() < self.p:
+            noise = torch.randn_like(image) * self.std
+            image = torch.clamp(image + noise, 0.0, 1.0)
+        return image, target
+
+
+class RandomVerticalFlip(object):
+    def __init__(self, flip_prob):
+        self.flip_prob = flip_prob
+
+    def __call__(self, image, target):
+        if random.random() < self.flip_prob:
+            image  = F.vflip(image)
+            target = F.vflip(target)
+        return image, target
+

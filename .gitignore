@@ -5,3 +5,4 @@ pretrained_weights/
 *.pt
 *.pyc
 __pycache__/
+pred_results/

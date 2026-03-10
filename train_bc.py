@@ -142,10 +142,33 @@ def get_dataset(split, transform, args):
 # ── transforms ────────────────────────────────────────────────────────────────
 
 def get_transform(args):
-    # ImageNet mean/std works fine for 3-channel grayscale replicated images
+    """
+    Augmentation pipeline tuned for chest CT soft-tissue segmentation.
+
+    Spatial (applied on PIL, mask follows):
+      - RandomHorizontalFlip      : left-right symmetry variation
+      - RandomAffine              : rotation ±15°, translation ±10%,
+                                    scale 0.85-1.15, shear ±5°
+                                    → simulates patient positioning shift
+
+    Intensity (Tensor, applied after ToTensor):
+      - RandomGaussianNoise       : σ=0.02
+                                    → simulates CT acquisition noise
+
+    Note: RandomBrightnessContrast is NOT used because HU windowing
+    is already fixed at preprocessing (clip + normalize → uint8 PNG).
+    """
     tfms = [
         T.Resize(args.img_size, args.img_size),
+        T.RandomHorizontalFlip(flip_prob=0.5),
+        T.RandomAffine(
+            angle=(-15, 15),
+            translate=(0.10, 0.10),
+            scale=(0.85, 1.15),
+            shear=(-5, 5),
+        ),
         T.ToTensor(),
+        T.RandomGaussianNoise(std=0.02, p=0.5),
         T.Normalize(mean=[0.485, 0.456, 0.406],
                     std=[0.229, 0.224, 0.225]),
     ]
