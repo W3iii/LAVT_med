@@ -41,6 +41,8 @@ import time
 from functools import reduce
 import operator
 
+import random
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -48,6 +50,7 @@ import torch.utils.data
 from torch import nn
 
 import torchvision
+from collections import defaultdict
 
 import transforms as T
 import utils
@@ -115,7 +118,69 @@ def get_parser():
     return parser
 
 
-# ── dataset factory ───────────────────────────────────────────────────────────
+# ── patient-aware batch sampler ────────────────────────────────────────────────
+
+class PatientAwareBatchSampler(torch.utils.data.Sampler):
+    """
+    Yields batches where each sample comes from a different patient.
+
+    Algorithm per epoch:
+      1. Shuffle indices within each patient.
+      2. Round-robin one index per patient → flat list where consecutive
+         indices are from different patients.
+      3. Slice the flat list into batches of size B.
+         Because of the interleaving, collisions within a batch are rare
+         (only possible when num_patients < batch_size).
+    """
+
+    def __init__(self, annotations, batch_size, drop_last=True, seed=42):
+        self.batch_size = batch_size
+        self.drop_last  = drop_last
+        self.seed       = seed
+        self.epoch      = 0
+
+        # group indices by patient
+        patient_indices = defaultdict(list)
+        for idx, ann in enumerate(annotations):
+            patient_indices[ann['patient_id']].append(idx)
+        self.patient_indices = dict(patient_indices)
+        self.total = sum(len(v) for v in self.patient_indices.values())
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+
+        # shuffle within each patient
+        queues = {}
+        for pid, indices in self.patient_indices.items():
+            q = indices[:]
+            rng.shuffle(q)
+            queues[pid] = q
+
+        # round-robin interleave: one sample per patient per round
+        pids = list(queues.keys())
+        flat = []
+        max_len = max(len(v) for v in queues.values())
+        for i in range(max_len):
+            rng.shuffle(pids)
+            for pid in pids:
+                if i < len(queues[pid]):
+                    flat.append(queues[pid][i])
+
+        # yield batches
+        for start in range(0, len(flat), self.batch_size):
+            batch = flat[start:start + self.batch_size]
+            if len(batch) == self.batch_size:
+                yield batch
+            elif not self.drop_last:
+                yield batch
+
+    def __len__(self):
+        if self.drop_last:
+            return self.total // self.batch_size
+        return (self.total + self.batch_size - 1) // self.batch_size
 
 def get_dataset(split, transform, args):
     from data.dataset_ln import LNDataset
@@ -329,19 +394,27 @@ def main(args):
         )
         print(f'local_rank {args.local_rank} / global_rank {global_rank} '
               f'built train dataset.')
+        data_loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            sampler=train_sampler,
+            num_workers=args.workers,
+            pin_memory=args.pin_mem,
+            drop_last=True,
+        )
     else:
-        train_sampler = torch.utils.data.RandomSampler(dataset)
+        train_sampler = PatientAwareBatchSampler(
+            dataset.annotations, batch_size=args.batch_size,
+            drop_last=True, seed=42,
+        )
+        data_loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_sampler=train_sampler,
+            num_workers=args.workers,
+            pin_memory=args.pin_mem,
+        )
 
     val_sampler = torch.utils.data.SequentialSampler(dataset_val)
-
-    data_loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        sampler=train_sampler,
-        num_workers=args.workers,
-        pin_memory=args.pin_mem,
-        drop_last=True,
-    )
     data_loader_val = torch.utils.data.DataLoader(
         dataset_val,
         batch_size=1,
@@ -448,6 +521,8 @@ def main(args):
     for epoch in range(max(0, resume_epoch + 1), args.epochs):
         if distributed:
             data_loader.sampler.set_epoch(epoch)
+        else:
+            train_sampler.set_epoch(epoch)
 
         train_one_epoch(
             model, criterion, optimizer, data_loader,
