@@ -256,11 +256,19 @@ def IoU(pred, gt):
 
 # ── evaluation ────────────────────────────────────────────────────────────────
 
-def evaluate(model, data_loader, bert_model):
+def evaluate(model, data_loader, bert_model, dataset_val=None):
+    """
+    Evaluate on validation set.
+    Metrics are computed ONLY on positive samples (is_pos=1) where
+    there is a real ground-truth mask. Negative samples are evaluated
+    separately via true-negative rate (model predicts no foreground).
+    """
     model.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Val:'
     total_its = 0
+
+    # positive sample metrics
     acc_ious  = 0
     cum_I, cum_U = 0, 0
     eval_seg_iou_list = [.5, .6, .7, .8, .9]
@@ -268,8 +276,14 @@ def evaluate(model, data_loader, bert_model):
     seg_total   = 0
     mean_IoU    = []
 
+    # negative sample metrics
+    neg_total   = 0
+    neg_correct = 0  # true negatives: model predicts no foreground
+
+    annotations = dataset_val.annotations if dataset_val is not None else None
+
     with torch.no_grad():
-        for data in metric_logger.log_every(data_loader, 100, header):
+        for idx, data in enumerate(metric_logger.log_every(data_loader, 100, header)):
             total_its += 1
             image, target, sentences, attentions = data
             image     = image.cuda(non_blocking=True)
@@ -290,31 +304,48 @@ def evaluate(model, data_loader, bert_model):
             else:
                 output = model(image, sentences, l_mask=attentions)
 
-            iou, I, U = IoU(output, target)
-            acc_ious += iou
-            mean_IoU.append(iou)
-            cum_I += I
-            cum_U += U
-            for n_eval_iou, eval_seg_iou in enumerate(eval_seg_iou_list):
-                seg_correct[n_eval_iou] += (iou >= eval_seg_iou)
-            seg_total += 1
+            is_pos = annotations[idx]['is_pos'] if annotations else 1
 
-    mean_IoU = np.array(mean_IoU)
-    mIoU     = np.mean(mean_IoU)
-    iou      = acc_ious / total_its
+            if is_pos == 1:
+                iou, I, U = IoU(output, target)
+                acc_ious += iou
+                mean_IoU.append(iou)
+                cum_I += I
+                cum_U += U
+                for n_eval_iou, eval_seg_iou in enumerate(eval_seg_iou_list):
+                    seg_correct[n_eval_iou] += (iou >= eval_seg_iou)
+                seg_total += 1
+            else:
+                # negative: model should predict all background
+                pred = output.cpu().argmax(1)
+                neg_total += 1
+                if pred.sum() == 0:
+                    neg_correct += 1
+
+    if seg_total > 0:
+        mean_IoU = np.array(mean_IoU)
+        mIoU     = np.mean(mean_IoU)
+        iou      = acc_ious / seg_total
+        overall  = float(cum_I) / float(cum_U) if cum_U > 0 else 0.0
+    else:
+        mIoU = iou = overall = 0.0
+
+    tn_rate = neg_correct / neg_total if neg_total > 0 else 0.0
 
     print('Final val results:')
+    print(f'  Positive samples: {seg_total}')
     print('  Mean IoU: %.2f%%' % (mIoU * 100.))
     results_str = ''
     for n_eval_iou in range(len(eval_seg_iou_list)):
         results_str += '    precision@%.1f = %.2f%%\n' % (
             eval_seg_iou_list[n_eval_iou],
-            seg_correct[n_eval_iou] * 100. / seg_total,
+            seg_correct[n_eval_iou] * 100. / max(seg_total, 1),
         )
-    results_str += '    overall IoU = %.2f%%\n' % (cum_I * 100. / cum_U)
+    results_str += '    overall IoU = %.2f%%\n' % (overall * 100.)
+    results_str += f'  Negative samples: {neg_total}  TN rate: {tn_rate*100:.2f}%'
     print(results_str)
 
-    return 100 * iou, 100 * cum_I / cum_U
+    return 100 * iou, 100 * overall
 
 
 # ── train one epoch ───────────────────────────────────────────────────────────
@@ -382,9 +413,15 @@ def main(args):
         os.makedirs(os.path.join('./models', args.model_id), exist_ok=True)
 
     # ── datasets ─────────────────────────────────────────────────────────
-    transform = get_transform(args)
-    dataset,      num_classes = get_dataset('train', transform, args)
-    dataset_val,  _           = get_dataset('val',   transform, args)
+    train_transform = get_transform(args)
+    val_transform = T.Compose([
+        T.Resize(args.img_size, args.img_size),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225]),
+    ])
+    dataset,      num_classes = get_dataset('train', train_transform, args)
+    dataset_val,  _           = get_dataset('val',   val_transform,   args)
 
     if distributed:
         num_tasks    = utils.get_world_size()
@@ -529,7 +566,8 @@ def main(args):
             lr_scheduler, epoch, args.print_freq, iterations, bert_model,
         )
 
-        iou, overallIoU = evaluate(model, data_loader_val, bert_model)
+        iou, overallIoU = evaluate(model, data_loader_val, bert_model,
+                                   dataset_val=dataset_val)
         print(f'Epoch {epoch}  |  Mean IoU: {iou:.2f}  |  Overall IoU: {overallIoU:.2f}')
 
         save_checkpoint = best_oIoU < overallIoU
