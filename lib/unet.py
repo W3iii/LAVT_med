@@ -139,7 +139,7 @@ class TextConditionedUNet(nn.Module):
         if num_heads_fusion is None:
             num_heads_fusion = [1, 1, 1, 1]
 
-        # PWAM at each encoder stage
+        # PWAM + gated residual at each encoder stage (same as LAVT Swin stages)
         # PWAM input: (B, H*W, dim), lang: (B, 768, seq_len), mask: (B, seq_len, 1)
         self.pwam1 = PWAM(chs[0], chs[0], lang_dim, chs[0], chs[0],
                           num_heads=num_heads_fusion[0], dropout=fusion_drop)
@@ -149,6 +149,16 @@ class TextConditionedUNet(nn.Module):
                           num_heads=num_heads_fusion[2], dropout=fusion_drop)
         self.pwam4 = PWAM(chs[3], chs[3], lang_dim, chs[3], chs[3],
                           num_heads=num_heads_fusion[3], dropout=fusion_drop)
+
+        # gated residual (matches LAVT backbone's res_gate)
+        self.res_gate1 = nn.Sequential(nn.Linear(chs[0], chs[0], bias=False), nn.ReLU(),
+                                       nn.Linear(chs[0], chs[0], bias=False), nn.Tanh())
+        self.res_gate2 = nn.Sequential(nn.Linear(chs[1], chs[1], bias=False), nn.ReLU(),
+                                       nn.Linear(chs[1], chs[1], bias=False), nn.Tanh())
+        self.res_gate3 = nn.Sequential(nn.Linear(chs[2], chs[2], bias=False), nn.ReLU(),
+                                       nn.Linear(chs[2], chs[2], bias=False), nn.Tanh())
+        self.res_gate4 = nn.Sequential(nn.Linear(chs[3], chs[3], bias=False), nn.ReLU(),
+                                       nn.Linear(chs[3], chs[3], bias=False), nn.Tanh())
 
         # bottleneck
         self.bottleneck = ConvBlock(chs[3], chs[3] * 2)
@@ -175,12 +185,11 @@ class TextConditionedUNet(nn.Module):
         features = self.backbone(x)  # [e1, e2, e3, e4]
         e1, e2, e3, e4 = features
 
-        # PWAM text injection at each stage
-        B = x.shape[0]
-        e1 = self._apply_pwam(self.pwam1, e1, l_feats, l_mask)
-        e2 = self._apply_pwam(self.pwam2, e2, l_feats, l_mask)
-        e3 = self._apply_pwam(self.pwam3, e3, l_feats, l_mask)
-        e4 = self._apply_pwam(self.pwam4, e4, l_feats, l_mask)
+        # PWAM text injection + gated residual at each stage
+        e1 = self._apply_pwam(self.pwam1, self.res_gate1, e1, l_feats, l_mask)
+        e2 = self._apply_pwam(self.pwam2, self.res_gate2, e2, l_feats, l_mask)
+        e3 = self._apply_pwam(self.pwam3, self.res_gate3, e3, l_feats, l_mask)
+        e4 = self._apply_pwam(self.pwam4, self.res_gate4, e4, l_feats, l_mask)
 
         # bottleneck
         b = self.bottleneck(self.pool(e4))
@@ -195,9 +204,14 @@ class TextConditionedUNet(nn.Module):
         out = F.interpolate(out, size=input_shape, mode='bilinear', align_corners=True)
         return out
 
-    def _apply_pwam(self, pwam, feat, l_feats, l_mask):
-        """Reshape (B,C,H,W) -> (B,H*W,C) for PWAM, then back."""
+    def _apply_pwam(self, pwam, res_gate, feat, l_feats, l_mask):
+        """
+        Apply PWAM with gated residual, matching LAVT backbone:
+            x_residual = pwam(x, l, l_mask)
+            x = x + res_gate(x_residual) * x_residual
+        """
         B, C, H, W = feat.shape
         feat_flat = feat.permute(0, 2, 3, 1).reshape(B, H * W, C)  # (B, H*W, C)
-        feat_flat = pwam(feat_flat, l_feats, l_mask)                # (B, H*W, C)
+        x_residual = pwam(feat_flat, l_feats, l_mask)               # (B, H*W, C)
+        feat_flat = feat_flat + res_gate(x_residual) * x_residual   # gated residual
         return feat_flat.reshape(B, H, W, C).permute(0, 3, 1, 2)   # (B, C, H, W)
