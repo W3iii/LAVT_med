@@ -140,7 +140,9 @@ class TextConditionedUNet(nn.Module):
             num_heads_fusion = [1, 1, 1, 1]
 
         # PWAM + gated residual at each encoder stage (same as LAVT Swin stages)
-        # PWAM input: (B, H*W, dim), lang: (B, 768, seq_len), mask: (B, seq_len, 1)
+        # Stage 1: PWAM runs on /4 downsampled feature to save memory,
+        #          then upsampled back to /1 for full-resolution text conditioning
+        self.pwam1_downsample = 4  # downsample factor for stage 1 PWAM
         self.pwam1 = PWAM(chs[0], chs[0], lang_dim, chs[0], chs[0],
                           num_heads=num_heads_fusion[0], dropout=fusion_drop)
         self.pwam2 = PWAM(chs[1], chs[1], lang_dim, chs[1], chs[1],
@@ -186,7 +188,9 @@ class TextConditionedUNet(nn.Module):
         e1, e2, e3, e4 = features
 
         # PWAM text injection + gated residual at each stage
-        e1 = self._apply_pwam(self.pwam1, self.res_gate1, e1, l_feats, l_mask)
+        # Stage 1: downsample → PWAM → upsample to avoid OOM on /1 resolution
+        e1 = self._apply_pwam_downsampled(self.pwam1, self.res_gate1, e1, l_feats, l_mask,
+                                          ds_factor=self.pwam1_downsample)
         e2 = self._apply_pwam(self.pwam2, self.res_gate2, e2, l_feats, l_mask)
         e3 = self._apply_pwam(self.pwam3, self.res_gate3, e3, l_feats, l_mask)
         e4 = self._apply_pwam(self.pwam4, self.res_gate4, e4, l_feats, l_mask)
@@ -215,3 +219,26 @@ class TextConditionedUNet(nn.Module):
         x_residual = pwam(feat_flat, l_feats, l_mask)               # (B, H*W, C)
         feat_flat = feat_flat + res_gate(x_residual) * x_residual   # gated residual
         return feat_flat.reshape(B, H, W, C).permute(0, 3, 1, 2)   # (B, C, H, W)
+
+    def _apply_pwam_downsampled(self, pwam, res_gate, feat, l_feats, l_mask, ds_factor=4):
+        """
+        Stage 1 PWAM: downsample /1 feature → run PWAM at /ds_factor → upsample residual back.
+        Keeps full /1 resolution in skip connection while adding text conditioning.
+        480×480 → 120×120 (14,400 tokens) for PWAM → upsample gate back to 480×480.
+        """
+        B, C, H, W = feat.shape
+        Hd, Wd = H // ds_factor, W // ds_factor
+
+        # downsample feature for PWAM
+        feat_down = F.adaptive_avg_pool2d(feat, (Hd, Wd))                          # (B, C, Hd, Wd)
+        feat_down_flat = feat_down.permute(0, 2, 3, 1).reshape(B, Hd * Wd, C)      # (B, Hd*Wd, C)
+
+        # PWAM on downsampled feature
+        x_residual_down = pwam(feat_down_flat, l_feats, l_mask)                     # (B, Hd*Wd, C)
+        gate_down = res_gate(x_residual_down) * x_residual_down                     # (B, Hd*Wd, C)
+
+        # upsample gate back to original resolution
+        gate_2d = gate_down.reshape(B, Hd, Wd, C).permute(0, 3, 1, 2)              # (B, C, Hd, Wd)
+        gate_up = F.interpolate(gate_2d, size=(H, W), mode='bilinear', align_corners=True)  # (B, C, H, W)
+
+        return feat + gate_up
