@@ -14,9 +14,12 @@ class _LAVTSimpleDecode(nn.Module):
         # existence head: predicts whether queried category exists in this slice
         feat_ch = classifier.feat_channels
         self.exist_head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
+            nn.AdaptiveAvgPool2d(4),   
             nn.Flatten(),
-            nn.Linear(feat_ch, 1),
+            nn.Linear(feat_ch * 16, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 1),
         )
 
     def forward(self, x, l_feats, l_mask):

@@ -30,7 +30,7 @@ from PIL import Image
 import torch
 import torch.utils.data as data
 
-from bert.tokenization_bert import BertTokenizer
+from transformers import BertTokenizer
 
 
 class LNDataset(data.Dataset):
