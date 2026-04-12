@@ -265,13 +265,11 @@ def focal_loss_per_sample(input, target, alpha=0.75, gamma=2.0):
 
 def criterion(seg_out, exist_out, target, is_pos,
               category=None, exist_weight=0.5):
-    B = seg_out.shape[0]
-
     # ── existence loss（全 batch，向量化）─────────────────────────────────
-    exist_gt   = is_pos.float().view(B, 1)
+    exist_gt   = is_pos.float()  # (B,)
     exist_loss = nn.functional.binary_cross_entropy_with_logits(
         exist_out, exist_gt,
-        pos_weight=torch.tensor([3.0], device=seg_out.device)
+        pos_weight=torch.tensor(3.0, device=seg_out.device)
     )
 
     # ── segmentation loss（只有正樣本）────────────────────────────────────
