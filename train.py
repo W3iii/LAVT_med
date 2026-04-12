@@ -482,8 +482,14 @@ def train_one_epoch(model, criterion, optimizer, data_loader,
             seg_out, exist_out = model(image, sentences, l_mask=attentions, category=category)
 
         is_pos = meta['is_pos'].cuda()
-        loss = criterion(seg_out, exist_out, target,
-                         is_pos=is_pos, category=category)
+        loss = criterion(seg_out, 
+                         exist_out, 
+                         target,
+                         is_pos=is_pos, 
+                         category=category, 
+                         exist_weight = 0.5
+        )
+        
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
