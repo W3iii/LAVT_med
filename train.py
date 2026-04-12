@@ -45,6 +45,7 @@ import random
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.data
 from torch import nn
 
@@ -274,7 +275,7 @@ def criterion(seg_out, exist_out, target, is_pos,
     )
 
     # ── segmentation loss（只有正樣本）────────────────────────────────────
-    has_fg = target.flatten(1).sum(1) > 0   # (B,)
+    has_fg = is_pos.bool()   # (B,)
 
     if not has_fg.any():
         return exist_weight * exist_loss
@@ -301,6 +302,19 @@ def criterion(seg_out, exist_out, target, is_pos,
 
     return seg_loss + exist_weight * exist_loss
 
+def class_embed_contrastive_loss(model):
+    """
+    Push the 4 category embeddings apart (computed once per iteration).
+    Uses all-pairs cosine similarity with margin.
+    """
+    # get class embeddings for cls 1-4 (skip index 0 = normal)
+    embs = model.class_embed.weight[1:5]  # (4, 768)
+    embs = nn.functional.normalize(embs, dim=-1)
+    sim = torch.mm(embs, embs.t())  # (4, 4)
+    # exclude diagonal
+    mask = ~torch.eye(4, dtype=torch.bool, device=sim.device)
+    # push all off-diagonal cosine similarities toward 0
+    return sim[mask].pow(2).mean()
 
 # ── IoU ───────────────────────────────────────────────────────────────────────
 
@@ -490,6 +504,9 @@ def train_one_epoch(model, criterion, optimizer, data_loader,
                          exist_weight = 0.5
         )
         
+        # contrastive loss on class embeddings (once per iteration)
+        single = model.module if hasattr(model, 'module') else model
+        loss = loss + 0.1 * class_embed_contrastive_loss(single)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
