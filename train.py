@@ -1,14 +1,8 @@
 """
-train_ln.py  (modified)
+train_ln.py  (fixed v3)
 ───────────
-Key changes:
-  1. criterion: remove redundant cross_entropy, keep only focal + dice
-  2. criterion: negative samples also get seg loss (penalise false positives)
-  3. exist_weight raised from 0.5 → 1.0, pos_weight raised to match ratio
-  4. evaluate: report both gated and ungated IoU; best model uses ungated
-  5. contrastive loss warmup: only applied after epoch 5
-  6. params_to_optimize updated (no more feat_channels / exist_head from
-     classifier; exist_head is lazy-built inside model)
+Fix: removed all lazy-build logic for exist_head.
+exist_head params are in params_to_optimize from the start.
 """
 
 import argparse
@@ -40,33 +34,17 @@ from lib import segmentation
 def get_parser():
     parser = argparse.ArgumentParser(description='LAVT-LN training')
 
-    # ── dataset ──
-    parser.add_argument('--ln_dataset_root', default='../dataset',
-                        help='root of the generated LN dataset')
-
-    # ── model ──
-    parser.add_argument('--model', default='lavt',
-                        help='backbone variant: lavt or lavt_one')
-    parser.add_argument('--model_id', default='lavt_ln',
-                        help='identifier used for checkpoint naming')
-    parser.add_argument('--swin_type', default='base',
-                        help='tiny | small | base | large')
-    parser.add_argument('--pretrained_swin_weights', default='',
-                        help='path to pre-trained Swin backbone weights')
+    parser.add_argument('--ln_dataset_root', default='../dataset')
+    parser.add_argument('--model', default='lavt')
+    parser.add_argument('--model_id', default='lavt_ln')
+    parser.add_argument('--swin_type', default='base')
+    parser.add_argument('--pretrained_swin_weights', default='')
     parser.add_argument('--window12', action='store_true')
-    parser.add_argument('--mha', default='',
-                        help='PWAM head config, e.g. "4-4-4-4"')
+    parser.add_argument('--mha', default='')
     parser.add_argument('--fusion_drop', default=0.0, type=float)
-
-    # ── BERT ──
     parser.add_argument('--bert_tokenizer', default='bert-base-uncased')
     parser.add_argument('--ck_bert', default='bert-base-uncased')
-
-    # ── sampling ──
-    parser.add_argument('--neg_ratio', default=2.0, type=float,
-                        help='max negatives = neg_ratio × num_positives')
-
-    # ── training hyper-params ──
+    parser.add_argument('--neg_ratio', default=2.0, type=float)
     parser.add_argument('--epochs', default=40, type=int)
     parser.add_argument('-b', '--batch-size', default=4, type=int)
     parser.add_argument('--img_size', default=384, type=int)
@@ -75,13 +53,9 @@ def get_parser():
                         metavar='W', dest='weight_decay')
     parser.add_argument('--amsgrad', action='store_true')
     parser.add_argument('--early_stop', default=10, type=int)
-
-    # ── I/O ──
     parser.add_argument('--output-dir', default='./checkpoints/ln/')
     parser.add_argument('--resume', default='')
     parser.add_argument('--ddp_trained_weights', action='store_true')
-
-    # ── misc ──
     parser.add_argument('--print-freq', default=10, type=int)
     parser.add_argument('-j', '--workers', default=4, type=int)
     parser.add_argument('--pin_mem', action='store_true')
@@ -99,7 +73,6 @@ class PatientAwareBatchSampler(torch.utils.data.Sampler):
         self.drop_last  = drop_last
         self.seed       = seed
         self.epoch      = 0
-
         patient_indices = defaultdict(list)
         for idx, ann in enumerate(annotations):
             patient_indices[ann['patient_id']].append(idx)
@@ -116,7 +89,6 @@ class PatientAwareBatchSampler(torch.utils.data.Sampler):
             q = indices[:]
             rng.shuffle(q)
             queues[pid] = q
-
         pids = list(queues.keys())
         flat = []
         max_len = max(len(v) for v in queues.values())
@@ -125,7 +97,6 @@ class PatientAwareBatchSampler(torch.utils.data.Sampler):
             for pid in pids:
                 if i < len(queues[pid]):
                     flat.append(queues[pid][i])
-
         for start in range(0, len(flat), self.batch_size):
             batch = flat[start:start + self.batch_size]
             if len(batch) == self.batch_size:
@@ -142,53 +113,32 @@ class PatientAwareBatchSampler(torch.utils.data.Sampler):
 def get_dataset(split, transform, args):
     from data.dataset_ln import LNDataset
     ds = LNDataset(
-        args,
-        split=split,
-        image_transforms=transform,
-        target_transforms=None,
-        eval_mode=False,
-    )
+        args, split=split, image_transforms=transform,
+        target_transforms=None, eval_mode=False)
     num_classes = 2
     return ds, num_classes
 
-
-# ── transforms ────────────────────────────────────────────────────────────────
 
 def get_transform(args):
     tfms = [
         T.Resize(args.img_size, args.img_size),
         T.RandomHorizontalFlip(flip_prob=0.5),
-        T.RandomAffine(
-            angle=(-15, 15),
-            translate=(0.10, 0.10),
-            scale=(0.85, 1.15),
-            shear=(-5, 5),
-        ),
+        T.RandomAffine(angle=(-15, 15), translate=(0.10, 0.10),
+                       scale=(0.85, 1.15), shear=(-5, 5)),
         T.ToTensor(),
         T.RandomGaussianNoise(std=0.02, p=0.5),
-        T.Normalize(mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ]
     return T.Compose(tfms)
 
 
 # ── per-category loss weight ───────────────────────────────────────────────────
 CLS_LOSS_WEIGHT = {0: 1.0, 1: 2.0, 2: 1.5, 3: 1.0, 4: 1.0}
-
 _WEIGHT_TABLE = torch.tensor(
-    [CLS_LOSS_WEIGHT.get(i, 1.0) for i in range(5)],
-    dtype=torch.float32,
-)
+    [CLS_LOSS_WEIGHT.get(i, 1.0) for i in range(5)], dtype=torch.float32)
 
-
-# ── per-sample losses ──────────────────────────────────────────────────────────
 
 def dice_loss_per_sample(input, target, smooth=1.0):
-    """
-    input:  (B, 2, H, W) logits
-    target: (B, H, W)    long
-    return: (B,)         per-sample dice loss
-    """
     prob         = torch.softmax(input, dim=1)[:, 1]
     gt           = target.float()
     intersection = (prob * gt).sum(dim=(1, 2))
@@ -198,56 +148,32 @@ def dice_loss_per_sample(input, target, smooth=1.0):
 
 
 def focal_loss_per_sample(input, target, alpha=0.75, gamma=2.0):
-    """
-    input:  (B, 2, H, W) logits
-    target: (B, H, W)    long
-    return: (B,)         per-sample focal loss
-    """
     ce      = F.cross_entropy(input, target, reduction='none')
     prob    = torch.softmax(input, dim=1)
     p_t     = prob.gather(1, target.unsqueeze(1)).squeeze(1)
     alpha_t = torch.where(
         target == 1,
         torch.tensor(alpha,       device=input.device),
-        torch.tensor(1.0 - alpha, device=input.device),
-    )
+        torch.tensor(1.0 - alpha, device=input.device))
     focal_w = alpha_t * (1.0 - p_t) ** gamma
     return (focal_w * ce).mean(dim=(1, 2))
 
 
-# ── main criterion ─────────────────────────────────────────────────────────────
-
 def criterion(seg_out, exist_out, target, is_pos,
               category=None, exist_weight=1.0):
-    """
-    Changes vs original:
-      1. Removed redundant cross_entropy (focal already subsumes it)
-      2. Negative samples get seg loss too (penalise false positive pixels)
-      3. exist_weight default raised to 1.0
-      4. pos_weight for existence BCE raised to better match class imbalance
-    """
-    B = seg_out.shape[0]
-
-    # ── existence loss (全 batch) ────────────────────────────────────────
     exist_gt   = is_pos.float()
     exist_loss = F.binary_cross_entropy_with_logits(
         exist_out, exist_gt,
-        pos_weight=torch.tensor(6.0, device=seg_out.device),  # raised from 3.0
-    )
+        pos_weight=torch.tensor(6.0, device=seg_out.device))
 
-    # ── segmentation loss ────────────────────────────────────────────────
     has_fg = is_pos.bool()
 
-    # --- positive samples: focal + dice ---
     if has_fg.any():
         pos_input  = seg_out[has_fg]
         pos_target = target[has_fg]
-
         dice_per  = dice_loss_per_sample(pos_input, pos_target)
         focal_per = focal_loss_per_sample(pos_input, pos_target)
         loss_per  = focal_per + dice_per
-
-        # per-category weighting
         if category is not None:
             pos_cat = category[has_fg]
             cls_w   = _WEIGHT_TABLE.to(seg_out.device)[pos_cat]
@@ -257,34 +183,26 @@ def criterion(seg_out, exist_out, target, is_pos,
     else:
         pos_seg_loss = torch.tensor(0.0, device=seg_out.device)
 
-    # --- negative samples: penalise any predicted foreground ---
     has_bg = ~has_fg
     if has_bg.any():
-        neg_input  = seg_out[has_bg]       # (n_neg, 2, H, W)
-        neg_target = target[has_bg]        # (n_neg, H, W) — all zeros
-
-        # focal loss on negatives (should predict all background)
+        neg_input  = seg_out[has_bg]
+        neg_target = target[has_bg]
         neg_focal = focal_loss_per_sample(neg_input, neg_target)
         neg_seg_loss = neg_focal.mean()
     else:
         neg_seg_loss = torch.tensor(0.0, device=seg_out.device)
 
-    # combine: weight negatives less than positives (they're easier)
     seg_loss = pos_seg_loss + 0.5 * neg_seg_loss
-
     return seg_loss + exist_weight * exist_loss
 
 
 def class_embed_contrastive_loss(model):
-    """Push the 4 category embeddings apart."""
-    embs = model.class_embed.weight[1:5]  # (4, 768)
+    embs = model.class_embed.weight[1:5]
     embs = F.normalize(embs, dim=-1)
     sim = torch.mm(embs, embs.t())
     mask = ~torch.eye(4, dtype=torch.bool, device=sim.device)
     return sim[mask].pow(2).mean()
 
-
-# ── IoU ───────────────────────────────────────────────────────────────────────
 
 def IoU(pred, gt):
     pred = pred.argmax(1)
@@ -297,41 +215,24 @@ def IoU(pred, gt):
     return iou, intersection, union
 
 
-# ── evaluation ────────────────────────────────────────────────────────────────
-
 def evaluate(model, data_loader, bert_model):
-    """
-    Changes vs original:
-      - Reports BOTH ungated and gated IoU so you can see true seg ability
-      - Returns ungated overall IoU as the primary metric for checkpointing
-    """
     model.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Val:'
 
-    # positive sample metrics (ungated = seg head only)
     acc_ious_ungated = 0
     cum_I_ungated, cum_U_ungated = 0, 0
     mean_IoU_ungated = []
-
-    # positive sample metrics (gated = existence head filters)
     acc_ious_gated = 0
     cum_I_gated, cum_U_gated = 0, 0
-
     eval_seg_iou_list = [.5, .6, .7, .8, .9]
     seg_correct = np.zeros(len(eval_seg_iou_list), dtype=np.int32)
     seg_total   = 0
-
-    # negative sample metrics
     neg_total = 0
     neg_correct = 0
     neg_correct_exist = 0
-
-    # existence head accuracy
     exist_correct = 0
     exist_total   = 0
-
-    # per-category
     cat_ious = {1: [], 2: [], 3: [], 4: []}
 
     with torch.no_grad():
@@ -341,52 +242,41 @@ def evaluate(model, data_loader, bert_model):
             target     = target.cuda(non_blocking=True)
             sentences  = sentences.cuda(non_blocking=True)
             attentions = attentions.cuda(non_blocking=True)
-
             sentences  = sentences.squeeze(1)
             attentions = attentions.squeeze(1)
             category   = meta['category'].cuda()
 
             if bert_model is not None:
                 last_hidden_states = bert_model(
-                    sentences, attention_mask=attentions
-                )[0]
+                    sentences, attention_mask=attentions)[0]
                 embedding  = last_hidden_states.permute(0, 2, 1)
                 attentions = attentions.unsqueeze(dim=-1)
                 seg_out, exist_out = model(
-                    image, embedding, l_mask=attentions, category=category
-                )
+                    image, embedding, l_mask=attentions, category=category)
             else:
                 seg_out, exist_out = model(
-                    image, sentences, l_mask=attentions, category=category
-                )
+                    image, sentences, l_mask=attentions, category=category)
 
             is_pos     = meta['is_pos'].item()
             cat        = meta['category'].item()
             exist_prob = torch.sigmoid(exist_out).item()
 
-            # existence accuracy
             exist_total += 1
             exist_pred = 1 if exist_prob >= 0.5 else 0
             if exist_pred == is_pos:
                 exist_correct += 1
 
             if is_pos == 1:
-                # --- ungated (true seg ability) ---
                 iou_ug, I_ug, U_ug = IoU(seg_out, target)
                 acc_ious_ungated += iou_ug
                 mean_IoU_ungated.append(iou_ug)
                 cum_I_ungated += I_ug
                 cum_U_ungated += U_ug
-
-                # precision thresholds (ungated)
                 for n_eval_iou, eval_seg_iou in enumerate(eval_seg_iou_list):
                     seg_correct[n_eval_iou] += (iou_ug >= eval_seg_iou)
                 seg_total += 1
-
                 if cat in cat_ious:
                     cat_ious[cat].append(iou_ug)
-
-                # --- gated ---
                 if exist_prob >= 0.5:
                     iou_g, I_g, U_g = iou_ug, I_ug, U_ug
                 else:
@@ -394,7 +284,6 @@ def evaluate(model, data_loader, bert_model):
                 acc_ious_gated += iou_g
                 cum_I_gated += I_g
                 cum_U_gated += U_g
-
             else:
                 neg_total += 1
                 pred = seg_out.cpu().argmax(1)
@@ -403,7 +292,6 @@ def evaluate(model, data_loader, bert_model):
                 if exist_prob < 0.5:
                     neg_correct_exist += 1
 
-    # compute metrics
     if seg_total > 0:
         mIoU_ug    = np.mean(mean_IoU_ungated)
         overall_ug = float(cum_I_ungated) / float(cum_U_ungated) if cum_U_ungated > 0 else 0.0
@@ -422,8 +310,7 @@ def evaluate(model, data_loader, bert_model):
     for n_eval_iou in range(len(eval_seg_iou_list)):
         results_str += '    precision@%.1f = %.2f%%\n' % (
             eval_seg_iou_list[n_eval_iou],
-            seg_correct[n_eval_iou] * 100. / max(seg_total, 1),
-        )
+            seg_correct[n_eval_iou] * 100. / max(seg_total, 1))
     results_str += '    [UNGATED] overall IoU = %.2f%%\n' % (overall_ug * 100.)
     results_str += '    [GATED]   overall IoU = %.2f%%\n' % (overall_g * 100.)
     results_str += f'  Negative samples: {neg_total}\n'
@@ -439,12 +326,8 @@ def evaluate(model, data_loader, bert_model):
         else:
             results_str += f'    cls{cat} ({cat_names[cat]}): N/A\n'
     print(results_str)
-
-    # return UNGATED overall IoU as primary metric
     return 100 * mIoU_ug, 100 * overall_ug
 
-
-# ── train one epoch ───────────────────────────────────────────────────────────
 
 def train_one_epoch(model, criterion, optimizer, data_loader,
                     lr_scheduler, epoch, print_freq, iterations, bert_model):
@@ -462,33 +345,26 @@ def train_one_epoch(model, criterion, optimizer, data_loader,
         target     = target.cuda(non_blocking=True)
         sentences  = sentences.cuda(non_blocking=True)
         attentions = attentions.cuda(non_blocking=True)
-
         sentences  = sentences.squeeze(1)
         attentions = attentions.squeeze(1)
         category   = meta['category'].cuda()
 
         if bert_model is not None:
             last_hidden_states = bert_model(
-                sentences, attention_mask=attentions
-            )[0]
+                sentences, attention_mask=attentions)[0]
             embedding  = last_hidden_states.permute(0, 2, 1)
             attentions = attentions.unsqueeze(dim=-1)
             seg_out, exist_out = model(
-                image, embedding, l_mask=attentions, category=category
-            )
+                image, embedding, l_mask=attentions, category=category)
         else:
             seg_out, exist_out = model(
-                image, sentences, l_mask=attentions, category=category
-            )
+                image, sentences, l_mask=attentions, category=category)
 
         is_pos = meta['is_pos'].cuda()
         loss = criterion(
             seg_out, exist_out, target,
-            is_pos=is_pos, category=category,
-            exist_weight=1.0,   # raised from 0.5
-        )
+            is_pos=is_pos, category=category, exist_weight=1.0)
 
-        # contrastive loss on class embeddings (warmup: skip first 5 epochs)
         if epoch >= 5:
             single = model.module if hasattr(model, 'module') else model
             loss = loss + 0.1 * class_embed_contrastive_loss(single)
@@ -504,8 +380,6 @@ def train_one_epoch(model, criterion, optimizer, data_loader,
                              lr=optimizer.param_groups[0]['lr'])
 
 
-# ── main ──────────────────────────────────────────────────────────────────────
-
 def main(args):
     distributed = args.local_rank >= 0
     if distributed:
@@ -514,13 +388,11 @@ def main(args):
         os.makedirs(args.output_dir, exist_ok=True)
         os.makedirs(os.path.join('./models', args.model_id), exist_ok=True)
 
-    # ── datasets ─────────────────────────────────────────────────────────
     train_transform = get_transform(args)
     val_transform = T.Compose([
         T.Resize(args.img_size, args.img_size),
         T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
     dataset,     num_classes = get_dataset('train', train_transform, args)
     dataset_val, _           = get_dataset('val',   val_transform,   args)
@@ -529,48 +401,38 @@ def main(args):
         num_tasks   = utils.get_world_size()
         global_rank = utils.get_rank()
         train_sampler = torch.utils.data.distributed.DistributedSampler(
-            dataset, num_replicas=num_tasks, rank=global_rank, shuffle=True,
-        )
+            dataset, num_replicas=num_tasks, rank=global_rank, shuffle=True)
         data_loader = torch.utils.data.DataLoader(
-            dataset, batch_size=args.batch_size,
-            sampler=train_sampler, num_workers=args.workers,
-            pin_memory=args.pin_mem, drop_last=True,
-        )
+            dataset, batch_size=args.batch_size, sampler=train_sampler,
+            num_workers=args.workers, pin_memory=args.pin_mem, drop_last=True)
     else:
         train_sampler = PatientAwareBatchSampler(
             dataset.annotations, batch_size=args.batch_size,
-            drop_last=True, seed=42,
-        )
+            drop_last=True, seed=42)
         data_loader = torch.utils.data.DataLoader(
             dataset, batch_sampler=train_sampler,
-            num_workers=args.workers, pin_memory=args.pin_mem,
-        )
+            num_workers=args.workers, pin_memory=args.pin_mem)
 
     val_sampler = torch.utils.data.SequentialSampler(dataset_val)
     data_loader_val = torch.utils.data.DataLoader(
-        dataset_val, batch_size=1,
-        sampler=val_sampler, num_workers=args.workers,
-    )
+        dataset_val, batch_size=1, sampler=val_sampler,
+        num_workers=args.workers)
 
     print(f'Train: {len(dataset)} slices  |  Val: {len(dataset_val)} slices')
 
-    # ── model ─────────────────────────────────────────────────────────────
     print(f'Building model: {args.model}')
     model = segmentation.__dict__[args.model](
-        pretrained=args.pretrained_swin_weights, args=args,
-    )
+        pretrained=args.pretrained_swin_weights, args=args)
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model.cuda()
 
     if distributed:
         model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.local_rank], find_unused_parameters=True,
-        )
+            model, device_ids=[args.local_rank], find_unused_parameters=True)
         single_model = model.module
     else:
         single_model = model
 
-    # ── BERT ──────────────────────────────────────────────────────────────
     if args.model != 'lavt_one':
         bert_model = BertModel.from_pretrained(args.ck_bert)
         bert_model.pooler = None
@@ -578,14 +440,12 @@ def main(args):
         bert_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(bert_model)
         if distributed:
             bert_model = torch.nn.parallel.DistributedDataParallel(
-                bert_model, device_ids=[args.local_rank],
-            )
+                bert_model, device_ids=[args.local_rank])
         single_bert_model = bert_model.module if distributed else bert_model
     else:
         bert_model        = None
         single_bert_model = None
 
-    # ── resume ────────────────────────────────────────────────────────────
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu')
         single_model.load_state_dict(checkpoint['model'], strict=False)
@@ -601,11 +461,13 @@ def main(args):
         else:
             backbone_decay.append(m)
 
-    # collect class_embed, class_pos_embed, class_gate params
     class_params = [single_model.class_embed.weight,
                     single_model.class_pos_embed]
     for p in single_model.class_gate.parameters():
         class_params.append(p)
+
+    # exist_head params — directly available, no lazy-build
+    exist_params = list(single_model.exist_head.parameters())
 
     if args.model != 'lavt_one':
         params_to_optimize = [
@@ -613,7 +475,8 @@ def main(args):
             {'params': backbone_decay},
             {'params': [p for p in single_model.classifier.parameters()
                         if p.requires_grad]},
-            {'params': class_params, 'lr': args.lr * 2},  # slightly higher lr
+            {'params': class_params, 'lr': args.lr * 2},
+            {'params': exist_params},
             {'params': reduce(operator.concat,
                               [[p for p in single_bert_model.encoder.layer[i].parameters()
                                 if p.requires_grad]
@@ -626,53 +489,41 @@ def main(args):
             {'params': [p for p in single_model.classifier.parameters()
                         if p.requires_grad]},
             {'params': class_params, 'lr': args.lr * 2},
+            {'params': exist_params},
             {'params': reduce(operator.concat,
                               [[p for p in single_model.text_encoder.encoder.layer[i].parameters()
                                 if p.requires_grad]
                                for i in range(10)])},
         ]
 
-    # NOTE: exist_head params are lazy-built and will be added after first
-    # forward pass. We handle this by re-adding them after epoch 0.
-
-    # ── optimizer & scheduler ─────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
-        params_to_optimize,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        amsgrad=args.amsgrad,
-    )
+        params_to_optimize, lr=args.lr,
+        weight_decay=args.weight_decay, amsgrad=args.amsgrad)
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
-        lambda x: (1 - x / (len(data_loader) * args.epochs)) ** 0.9,
-    )
+        lambda x: (1 - x / (len(data_loader) * args.epochs)) ** 0.9)
 
-    # ── housekeeping ──────────────────────────────────────────────────────
     start_time       = time.time()
     iterations       = 0
     best_oIoU        = -0.1
     resume_epoch     = -999
     patience_counter = 0
-    exist_head_added = False
 
     if args.resume:
         optimizer.load_state_dict(checkpoint['optimizer'])
         lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
         resume_epoch = checkpoint['epoch']
 
-    # ── training loop ─────────────────────────────────────────────────────
     for epoch in range(max(0, resume_epoch + 1), args.epochs):
         if hasattr(dataset, 'resample_negatives'):
             dataset.resample_negatives(epoch=epoch)
             if not distributed:
                 train_sampler = PatientAwareBatchSampler(
                     dataset.annotations, batch_size=args.batch_size,
-                    drop_last=True, seed=42,
-                )
+                    drop_last=True, seed=42)
                 data_loader = torch.utils.data.DataLoader(
                     dataset, batch_sampler=train_sampler,
-                    num_workers=args.workers, pin_memory=args.pin_mem,
-                )
+                    num_workers=args.workers, pin_memory=args.pin_mem)
 
         if distributed:
             data_loader.sampler.set_epoch(epoch)
@@ -681,19 +532,7 @@ def main(args):
 
         train_one_epoch(
             model, criterion, optimizer, data_loader,
-            lr_scheduler, epoch, args.print_freq, iterations, bert_model,
-        )
-
-        # after first epoch, add lazy-built exist_head params to optimizer
-        if not exist_head_added and single_model._exist_head_built:
-            exist_params = list(single_model.exist_head.parameters())
-            optimizer.add_param_group({
-                'params': exist_params,
-                'lr': args.lr,
-                'weight_decay': args.weight_decay,
-            })
-            exist_head_added = True
-            print('  → Added exist_head params to optimizer')
+            lr_scheduler, epoch, args.print_freq, iterations, bert_model)
 
         iou, overallIoU = evaluate(model, data_loader_val, bert_model)
         print(f'Epoch {epoch}  |  Mean IoU: {iou:.2f}  |  Overall IoU: {overallIoU:.2f}')
@@ -711,12 +550,9 @@ def main(args):
             }
             if single_bert_model is not None:
                 dict_to_save['bert_model'] = single_bert_model.state_dict()
-
             utils.save_on_master(
                 dict_to_save,
-                os.path.join(args.output_dir,
-                             f'model_best_{args.model_id}.pth'),
-            )
+                os.path.join(args.output_dir, f'model_best_{args.model_id}.pth'))
             best_oIoU = overallIoU
         else:
             patience_counter += 1
@@ -727,8 +563,7 @@ def main(args):
 
     total_time = time.time() - start_time
     print('Training time: {}'.format(
-        str(datetime.timedelta(seconds=int(total_time)))
-    ))
+        str(datetime.timedelta(seconds=int(total_time)))))
 
 
 if __name__ == '__main__':
