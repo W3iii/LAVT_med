@@ -171,3 +171,79 @@ class RandomVerticalFlip(object):
             target = F.vflip(target)
         return image, target
 
+
+class ForegroundCrop(object):
+    """
+    nnU-Net style foreground oversampling crop (for training).
+
+    With probability `fg_prob`:
+      - Find foreground pixels in target mask
+      - Crop a patch centered on a random foreground pixel (with jitter)
+    With probability `1 - fg_prob`:
+      - Random crop
+
+    If target has no foreground, always does random crop.
+    Pads image/target if smaller than patch_size.
+    Place BEFORE Resize in the transform pipeline.
+    """
+    def __init__(self, patch_size, fg_prob=0.67):
+        self.patch_size = patch_size
+        self.fg_prob = fg_prob
+
+    def __call__(self, image, target):
+        w, h = image.size  # PIL: (w, h)
+        ps = self.patch_size
+
+        # Pad if needed
+        image = pad_if_smaller(image, ps, fill=0)
+        target = pad_if_smaller(target, ps, fill=0)
+        w, h = image.size
+
+        # Check for foreground
+        target_np = np.asarray(target)
+        fg_coords = np.argwhere(target_np > 0)  # (N, 2) → (y, x)
+
+        if len(fg_coords) > 0 and random.random() < self.fg_prob:
+            # Foreground crop: pick a random fg pixel, crop around it
+            idx = random.randint(0, len(fg_coords) - 1)
+            cy, cx = fg_coords[idx]
+
+            # Add jitter so nodule isn't always centered (±25% of patch)
+            jitter = ps // 4
+            cy += random.randint(-jitter, jitter)
+            cx += random.randint(-jitter, jitter)
+
+            # Compute crop box, clamp to image bounds
+            y0 = max(0, min(cy - ps // 2, h - ps))
+            x0 = max(0, min(cx - ps // 2, w - ps))
+        else:
+            # Random crop
+            y0 = random.randint(0, max(0, h - ps))
+            x0 = random.randint(0, max(0, w - ps))
+
+        image = F.crop(image, y0, x0, ps, ps)
+        target = F.crop(target, y0, x0, ps, ps)
+        return image, target
+
+
+def sliding_window_positions(h, w, patch_size, overlap=0.5):
+    """
+    Generate (y0, x0) positions for sliding window inference.
+    Covers the entire image with overlapping patches.
+    """
+    step = int(patch_size * (1 - overlap))
+    step = max(step, 1)
+    positions = []
+    for y0 in range(0, max(1, h - patch_size + 1), step):
+        for x0 in range(0, max(1, w - patch_size + 1), step):
+            positions.append((y0, x0))
+    # Ensure bottom-right corner is covered
+    if positions:
+        last_y = max(0, h - patch_size)
+        last_x = max(0, w - patch_size)
+        if positions[-1] != (last_y, last_x):
+            positions.append((last_y, last_x))
+    else:
+        positions.append((0, 0))
+    return positions
+

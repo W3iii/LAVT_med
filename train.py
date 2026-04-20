@@ -59,6 +59,14 @@ def get_parser():
     parser.add_argument('--print-freq', default=10, type=int)
     parser.add_argument('-j', '--workers', default=4, type=int)
     parser.add_argument('--pin_mem', action='store_true')
+    parser.add_argument('--patch_size', default=0, type=int,
+                        help='Foreground crop patch size (0=disabled). e.g. 128')
+    parser.add_argument('--fg_prob', default=0.67, type=float,
+                        help='Probability of foreground-centered crop (default 0.67)')
+    parser.add_argument('--iters_per_epoch', default=0, type=int,
+                        help='nnU-Net style: fixed iterations per epoch (0=traditional epoch)')
+    parser.add_argument('--val_every', default=5, type=int,
+                        help='Run validation every N epochs (default 5)')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--local_rank', type=int, default=-1)
 
@@ -120,7 +128,14 @@ def get_dataset(split, transform, args):
 
 
 def get_transform(args):
-    tfms = [
+    patch_size = getattr(args, 'patch_size', 0)
+    fg_prob = getattr(args, 'fg_prob', 0.67)
+
+    tfms = []
+    if patch_size > 0:
+        # Foreground oversampling: crop patch first, then resize to model input
+        tfms.append(T.ForegroundCrop(patch_size, fg_prob=fg_prob))
+    tfms += [
         T.Resize(args.img_size, args.img_size),
         T.RandomHorizontalFlip(flip_prob=0.5),
         T.RandomAffine(angle=(-15, 15), translate=(0.10, 0.10),
@@ -215,7 +230,54 @@ def IoU(pred, gt):
     return iou, intersection, union
 
 
-def evaluate(model, data_loader, bert_model):
+def sliding_window_inference(model, image_full, sentences, attentions,
+                             category, bert_model, patch_size, img_size,
+                             overlap=0.5):
+    """
+    Sliding window inference on a full-size image.
+    Returns aggregated seg_out and exist_out at the original resolution.
+    """
+    from transforms import sliding_window_positions
+    _, _, H, W = image_full.shape
+
+    positions = sliding_window_positions(H, W, patch_size, overlap)
+    pred_sum = torch.zeros(1, 2, H, W, device=image_full.device)
+    count_map = torch.zeros(1, 1, H, W, device=image_full.device)
+    exist_probs = []
+
+    for y0, x0 in positions:
+        patch = image_full[:, :, y0:y0+patch_size, x0:x0+patch_size]
+        # Resize patch to model input size
+        patch_resized = F.interpolate(patch, size=(img_size, img_size),
+                                      mode='bilinear', align_corners=False)
+
+        if bert_model is not None:
+            last_hidden_states = bert_model(
+                sentences, attention_mask=attentions)[0]
+            embedding = last_hidden_states.permute(0, 2, 1)
+            attn_mask = attentions.unsqueeze(dim=-1)
+            seg_patch, exist_out = model(
+                patch_resized, embedding, l_mask=attn_mask, category=category)
+        else:
+            seg_patch, exist_out = model(
+                patch_resized, sentences, l_mask=attentions, category=category)
+
+        # Resize prediction back to patch size
+        seg_patch_orig = F.interpolate(seg_patch, size=(patch_size, patch_size),
+                                       mode='bilinear', align_corners=False)
+        pred_sum[:, :, y0:y0+patch_size, x0:x0+patch_size] += seg_patch_orig
+        count_map[:, :, y0:y0+patch_size, x0:x0+patch_size] += 1
+        exist_probs.append(torch.sigmoid(exist_out).item())
+
+    # Average overlapping regions
+    count_map = torch.clamp(count_map, min=1)
+    seg_out = pred_sum / count_map
+    exist_prob = np.mean(exist_probs)
+
+    return seg_out, exist_prob
+
+
+def evaluate(model, data_loader, bert_model, patch_size=0, img_size=384):
     model.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Val:'
@@ -246,20 +308,30 @@ def evaluate(model, data_loader, bert_model):
             attentions = attentions.squeeze(1)
             category   = meta['category'].cuda()
 
-            if bert_model is not None:
-                last_hidden_states = bert_model(
-                    sentences, attention_mask=attentions)[0]
-                embedding  = last_hidden_states.permute(0, 2, 1)
-                attentions = attentions.unsqueeze(dim=-1)
-                seg_out, exist_out = model(
-                    image, embedding, l_mask=attentions, category=category)
-            else:
-                seg_out, exist_out = model(
-                    image, sentences, l_mask=attentions, category=category)
-
             is_pos     = meta['is_pos'].item()
             cat        = meta['category'].item()
-            exist_prob = torch.sigmoid(exist_out).item()
+
+            if patch_size > 0:
+                # Sliding window inference
+                seg_out, exist_prob = sliding_window_inference(
+                    model, image, sentences, attentions, category,
+                    bert_model, patch_size, img_size)
+                # Resize seg_out to match target size
+                seg_out = F.interpolate(seg_out, size=target.shape[-2:],
+                                        mode='bilinear', align_corners=False)
+            else:
+                # Standard full-image inference
+                if bert_model is not None:
+                    last_hidden_states = bert_model(
+                        sentences, attention_mask=attentions)[0]
+                    embedding  = last_hidden_states.permute(0, 2, 1)
+                    attentions = attentions.unsqueeze(dim=-1)
+                    seg_out, exist_out = model(
+                        image, embedding, l_mask=attentions, category=category)
+                else:
+                    seg_out, exist_out = model(
+                        image, sentences, l_mask=attentions, category=category)
+                exist_prob = torch.sigmoid(exist_out).item()
 
             exist_total += 1
             exist_pred = 1 if exist_prob >= 0.5 else 0
@@ -389,11 +461,18 @@ def main(args):
         os.makedirs(os.path.join('./models', args.model_id), exist_ok=True)
 
     train_transform = get_transform(args)
-    val_transform = T.Compose([
-        T.Resize(args.img_size, args.img_size),
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    if args.patch_size > 0:
+        # Sliding window: val images at original resolution (no Resize)
+        val_transform = T.Compose([
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+    else:
+        val_transform = T.Compose([
+            T.Resize(args.img_size, args.img_size),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
     dataset,     num_classes = get_dataset('train', train_transform, args)
     dataset_val, _           = get_dataset('val',   val_transform,   args)
 
@@ -534,7 +613,14 @@ def main(args):
             model, criterion, optimizer, data_loader,
             lr_scheduler, epoch, args.print_freq, iterations, bert_model)
 
-        iou, overallIoU = evaluate(model, data_loader_val, bert_model)
+        # Validate every val_every epochs (and always on the last epoch)
+        if (epoch + 1) % args.val_every != 0 and epoch != args.epochs - 1:
+            print(f'Epoch {epoch}  |  skip validation (every {args.val_every} epochs)')
+            continue
+
+        iou, overallIoU = evaluate(
+            model, data_loader_val, bert_model,
+            patch_size=args.patch_size, img_size=args.img_size)
         print(f'Epoch {epoch}  |  Mean IoU: {iou:.2f}  |  Overall IoU: {overallIoU:.2f}')
 
         save_ckpt = best_oIoU < overallIoU

@@ -46,6 +46,8 @@ class LNDataset(data.Dataset):
         self.image_transforms = image_transforms
         self.target_transforms = target_transforms
         self.max_tokens       = 20
+        self.iters_per_epoch  = getattr(args, 'iters_per_epoch', 0) if split == 'train' else 0
+        self.fg_prob          = getattr(args, 'fg_prob', 0.67)
 
         # ── load annotation JSON ──────────────────────────────────────────
         ann_path = os.path.join(args.ln_dataset_root, 'annotations', f'{split}.json')
@@ -108,12 +110,22 @@ class LNDataset(data.Dataset):
         return []
 
     def __len__(self):
+        if self.iters_per_epoch > 0:
+            return self.iters_per_epoch
         return len(self.annotations)
 
     # ── __getitem__ ───────────────────────────────────────────────────────
 
     def __getitem__(self, index):
-        ann = self.annotations[index]
+        if self.iters_per_epoch > 0:
+            # nnU-Net style: randomly pick a sample each iteration
+            # fg_prob chance to pick a positive sample
+            if self._pos and random.random() < self.fg_prob:
+                ann = random.choice(self._pos)
+            else:
+                ann = random.choice(self.annotations)
+        else:
+            ann = self.annotations[index]
 
         # ── image: grayscale PNG → 3-channel RGB ─────────────────────────
         img_path = os.path.join(self.image_dir, ann['image'])
