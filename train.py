@@ -262,12 +262,16 @@ def sliding_window_inference(model, image_full, sentences, attentions,
             seg_patch, exist_out = model(
                 patch_resized, sentences, l_mask=attentions, category=category)
 
+        # Gate by exist_head: skip patches the model thinks have no nodule
+        ep = torch.sigmoid(exist_out).item()
+        exist_probs.append(ep)
+
         # Resize prediction back to patch size
         seg_patch_orig = F.interpolate(seg_patch, size=(patch_size, patch_size),
                                        mode='bilinear', align_corners=False)
-        pred_sum[:, :, y0:y0+patch_size, x0:x0+patch_size] += seg_patch_orig
-        count_map[:, :, y0:y0+patch_size, x0:x0+patch_size] += 1
-        exist_probs.append(torch.sigmoid(exist_out).item())
+        if ep >= 0.5:
+            pred_sum[:, :, y0:y0+patch_size, x0:x0+patch_size] += seg_patch_orig
+            count_map[:, :, y0:y0+patch_size, x0:x0+patch_size] += 1
 
     # Average overlapping regions
     count_map = torch.clamp(count_map, min=1)
@@ -443,8 +447,17 @@ def train_one_epoch(model, criterion, optimizer, data_loader,
 
         optimizer.zero_grad()
         loss.backward()
-        optimizer.step()
-        lr_scheduler.step()
+        
+        if total_its == 1:
+            _m = model.module if hasattr(model, 'module') else model
+            for name, p in _m.exist_head.named_parameters():
+                grad = p.grad
+                if grad is None:
+                    print(f'  exist_head.{name}: grad=None !!!')
+                else:
+                    print(f'  exist_head.{name}: grad_norm={grad.norm().item():.6f}')
+                optimizer.step()
+                lr_scheduler.step()
 
         train_loss += loss.item()
         iterations += 1
@@ -510,6 +523,9 @@ def main(args):
         pretrained=args.pretrained_swin_weights, args=args)
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model.cuda()
+    
+    print('backbone.num_features:', single_model.backbone.num_features)
+    print('exist_head:', single_model.exist_head)
 
     if distributed:
         model = torch.nn.parallel.DistributedDataParallel(
