@@ -484,6 +484,12 @@ def main(args):
         data_loader = torch.utils.data.DataLoader(
             dataset, batch_size=args.batch_size, sampler=train_sampler,
             num_workers=args.workers, pin_memory=args.pin_mem, drop_last=True)
+    elif args.iters_per_epoch > 0:
+        # nnU-Net style: dataset.__len__ = iters_per_epoch, random sampling
+        train_sampler = torch.utils.data.RandomSampler(dataset)
+        data_loader = torch.utils.data.DataLoader(
+            dataset, batch_size=args.batch_size, sampler=train_sampler,
+            num_workers=args.workers, pin_memory=args.pin_mem, drop_last=True)
     else:
         train_sampler = PatientAwareBatchSampler(
             dataset.annotations, batch_size=args.batch_size,
@@ -596,7 +602,8 @@ def main(args):
     for epoch in range(max(0, resume_epoch + 1), args.epochs):
         if hasattr(dataset, 'resample_negatives'):
             dataset.resample_negatives(epoch=epoch)
-            if not distributed:
+            if not distributed and args.iters_per_epoch == 0:
+                # Rebuild PatientAwareBatchSampler with new annotations
                 train_sampler = PatientAwareBatchSampler(
                     dataset.annotations, batch_size=args.batch_size,
                     drop_last=True, seed=42)
@@ -606,7 +613,7 @@ def main(args):
 
         if distributed:
             data_loader.sampler.set_epoch(epoch)
-        else:
+        elif args.iters_per_epoch == 0:
             train_sampler.set_epoch(epoch)
 
         train_one_epoch(
