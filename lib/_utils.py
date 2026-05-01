@@ -1,11 +1,11 @@
 """
-lib/_utils.py  (v4)
+lib/_utils.py  (v5)
 ─────────────────────────
-Changes vs v3:
-  * exist_head 改用 class-conditioned attention pooling，能真正利用 prompt
-  * 所有 exist 相關的 projection 都收進 self.exist_module (ModuleDict)
-  * exist_head input 同時包含 attention-pooled feature 與 class_embed (residual)
-  * _LAVTSimpleDecode 與 _LAVTOneSimpleDecode 同步修改
+Changes vs v4:
+  * 移除 cls_emb residual concat shortcut (head 之前可繞過視覺特徵)
+  * 改用 FiLM modulation: attended * (1 + gamma) + beta，gamma/beta 由 cls_emb 產生
+  * head 輸入只剩 hidden-dim 的 modulated visual feature，強制必須看圖
+  * gamma/beta 初始化為 0，訓練起步等同恆等 modulation，避免 cold-start collapse
 """
 
 from collections import OrderedDict
@@ -20,9 +20,14 @@ from bert.modeling_bert import BertModel
 # ─────────────────────────────────────────────────────────────────────────────
 def _build_exist_module(c4_ch, c3_ch, cls_dim=768, hidden=256, dropout=0.3):
     """
-    Returns a ModuleDict containing all layers needed for the
-    class-conditioned attention-pooling exist head.
+    Class-conditioned attention pooling + FiLM modulation.
+    No residual cls shortcut — head only sees modulated visual features.
     """
+    film_gamma = nn.Linear(cls_dim, hidden)
+    film_beta  = nn.Linear(cls_dim, hidden)
+    nn.init.zeros_(film_gamma.weight); nn.init.zeros_(film_gamma.bias)
+    nn.init.zeros_(film_beta.weight);  nn.init.zeros_(film_beta.bias)
+
     return nn.ModuleDict({
         # project c4 / c3 spatial tokens to a unified hidden dim
         'c4_proj':    nn.Linear(c4_ch, hidden),
@@ -31,9 +36,12 @@ def _build_exist_module(c4_ch, c3_ch, cls_dim=768, hidden=256, dropout=0.3):
         'query_proj': nn.Linear(cls_dim, hidden),
         'k_proj':     nn.Linear(hidden,  hidden),
         'v_proj':     nn.Linear(hidden,  hidden),
-        # final classifier: attended feature + class_embed (residual)
+        # FiLM: cls_emb produces (gamma, beta) to modulate attended feature
+        'film_gamma': film_gamma,
+        'film_beta':  film_beta,
+        # final classifier: only modulated visual feature, no cls residual
         'head': nn.Sequential(
-            nn.Linear(hidden + cls_dim, hidden),
+            nn.Linear(hidden, hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, 1),
@@ -71,8 +79,11 @@ def _exist_attention_pool(exist_module, x_c4, x_c3, cls_emb):
     attn = F.softmax(attn, dim=-1)
     attended = torch.matmul(attn, v).squeeze(1)              # (B, hidden)
 
-    # Concat residual cls_emb so head still has signal even if attn collapses
-    exist_feat = torch.cat([attended, cls_emb], dim=1)       # (B, hidden+cls_dim)
+    # FiLM modulation: cls_emb shifts/scales attended visual feature.
+    # gamma/beta init to 0 → starts as identity, head sees raw attended at t=0.
+    gamma = exist_module['film_gamma'](cls_emb)              # (B, hidden)
+    beta  = exist_module['film_beta'](cls_emb)               # (B, hidden)
+    exist_feat = attended * (1.0 + gamma) + beta             # (B, hidden)
     return exist_module['head'](exist_feat).squeeze(-1)      # (B,)
 
 
