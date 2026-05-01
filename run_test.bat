@@ -1,13 +1,13 @@
 python test.py ^
     --model lavt ^
-    --model_id lavt_ln_existBCE ^
+    --model_id lavt_ln_existBCE_v3 ^
     --ln_dataset_root ../dataset ^
     --split test ^
     --bert_tokenizer dmis-lab/biobert-base-cased-v1.2 ^
     --ck_bert dmis-lab/biobert-base-cased-v1.2 ^
-    --resume ./checkpoints/ln_existBCE_v2_weighted/model_best_lavt_ln_existBCE.pth ^
+    --resume ./checkpoints/ln_existBCE_v3_weighted/model_best_lavt_ln_existBCE_v3.pth ^
     --swin_type base ^
     --window12 ^
     --img_size 512 ^
     --save_pred ^
-    --output_dir ./pred_results
+    --output_dir ./pred_results/v3
