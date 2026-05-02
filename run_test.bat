@@ -5,7 +5,7 @@ python test.py ^
     --split test ^
     --bert_tokenizer dmis-lab/biobert-base-cased-v1.2 ^
     --ck_bert dmis-lab/biobert-base-cased-v1.2 ^
-    --resume ./checkpoints/ln_existBCE_v3_weighted/model_best_lavt_ln_existBCE_v3.pth ^
+    --resume ./checkpoints/ln_existBCE_v3_weighted/model_best_lavt_ln_existBCE_v3_2.pth ^
     --swin_type base ^
     --window12 ^
     --img_size 512 ^
