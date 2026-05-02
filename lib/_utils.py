@@ -1,11 +1,11 @@
 """
-lib/_utils.py  (v5)
+lib/_utils.py  (v6)
 ─────────────────────────
-Changes vs v4:
-  * 移除 cls_emb residual concat shortcut (head 之前可繞過視覺特徵)
-  * 改用 FiLM modulation: attended * (1 + gamma) + beta，gamma/beta 由 cls_emb 產生
-  * head 輸入只剩 hidden-dim 的 modulated visual feature，強制必須看圖
-  * gamma/beta 初始化為 0，訓練起步等同恆等 modulation，避免 cold-start collapse
+Changes vs v5:
+  * 移除 FiLM 的 beta path (additive cls→head shortcut，先前實驗證實會被學成 lookup)
+  * 改用純乘性 sigmoid gating: attended * gate(cls_emb)
+  * gate_proj 權重初始化為 0、bias=0 → 起步 gate=0.5 (恆等縮放)
+  * 訓練必須讓 attended 帶有非常數視覺信號，否則整個 exist 輸出都會被乘成常數
 """
 
 from collections import OrderedDict
@@ -20,13 +20,12 @@ from bert.modeling_bert import BertModel
 # ─────────────────────────────────────────────────────────────────────────────
 def _build_exist_module(c4_ch, c3_ch, cls_dim=768, hidden=256, dropout=0.3):
     """
-    Class-conditioned attention pooling + FiLM modulation.
-    No residual cls shortcut — head only sees modulated visual features.
+    Class-conditioned attention pooling + pure multiplicative gating.
+    No additive cls path — head input is strictly attended * gate(cls).
     """
-    film_gamma = nn.Linear(cls_dim, hidden)
-    film_beta  = nn.Linear(cls_dim, hidden)
-    nn.init.zeros_(film_gamma.weight); nn.init.zeros_(film_gamma.bias)
-    nn.init.zeros_(film_beta.weight);  nn.init.zeros_(film_beta.bias)
+    gate_proj = nn.Linear(cls_dim, hidden)
+    nn.init.zeros_(gate_proj.weight)
+    nn.init.zeros_(gate_proj.bias)
 
     return nn.ModuleDict({
         # project c4 / c3 spatial tokens to a unified hidden dim
@@ -36,10 +35,9 @@ def _build_exist_module(c4_ch, c3_ch, cls_dim=768, hidden=256, dropout=0.3):
         'query_proj': nn.Linear(cls_dim, hidden),
         'k_proj':     nn.Linear(hidden,  hidden),
         'v_proj':     nn.Linear(hidden,  hidden),
-        # FiLM: cls_emb produces (gamma, beta) to modulate attended feature
-        'film_gamma': film_gamma,
-        'film_beta':  film_beta,
-        # final classifier: only modulated visual feature, no cls residual
+        # cls_emb → sigmoid gate over attended hidden dims
+        'gate_proj':  gate_proj,
+        # head only sees gated visual feature
         'head': nn.Sequential(
             nn.Linear(hidden, hidden),
             nn.ReLU(),
@@ -79,12 +77,11 @@ def _exist_attention_pool(exist_module, x_c4, x_c3, cls_emb):
     attn = F.softmax(attn, dim=-1)
     attended = torch.matmul(attn, v).squeeze(1)              # (B, hidden)
 
-    # FiLM modulation: cls_emb shifts/scales attended visual feature.
-    # gamma/beta init to 0 → starts as identity, head sees raw attended at t=0.
-    gamma = exist_module['film_gamma'](cls_emb)              # (B, hidden)
-    beta  = exist_module['film_beta'](cls_emb)               # (B, hidden)
-    exist_feat = attended * (1.0 + gamma) + beta             # (B, hidden)
-    return exist_module['head'](exist_feat).squeeze(-1)      # (B,)
+    # Pure multiplicative gating: cls_emb scales attended per-dim, no additive path.
+    # gate_proj is zero-init → gate=0.5 uniformly at t=0, so head sees attended/2.
+    gate = torch.sigmoid(exist_module['gate_proj'](cls_emb))  # (B, hidden) ∈ [0,1]
+    exist_feat = attended * gate                              # (B, hidden)
+    return exist_module['head'](exist_feat).squeeze(-1)       # (B,)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -1,8 +1,9 @@
 """
-train_ln.py  (fixed v3)
+train_ln.py  (v6)
 ───────────
-Fix: removed all lazy-build logic for exist_head.
-exist_head params are in params_to_optimize from the start.
+Changes vs v3:
+  * 加入 contrastive prompt pairing：每個 positive sample 額外 forward 一次「錯誤 cls + 錯誤 prompt」
+    並要求 exist=0 / seg=空 mask，強迫模型學會比對圖跟 prompt 是否一致。
 """
 
 import argparse
@@ -25,8 +26,32 @@ from collections import defaultdict
 
 import transforms as T
 import utils
-from transformers import BertModel
+from transformers import BertModel, BertTokenizer
 from lib import segmentation
+
+
+# ── 4 category prompts (must match test_language_disc.py) ────────────────────
+CAT_PROMPTS = {
+    1: "benign lung nodule",
+    2: "probably lung nodule",
+    3: "Probably Suspicious lung nodule",
+    4: "suspicious lung nodule",
+}
+
+
+def build_cat_prompt_tokens(tokenizer_name, max_tokens=20):
+    """Returns dict cat → (ids[max_tokens], attn[max_tokens]) for all 4 prompts."""
+    tokenizer = BertTokenizer.from_pretrained(tokenizer_name)
+    out = {}
+    for cat, sent in CAT_PROMPTS.items():
+        padded = [0] * max_tokens
+        attn   = [0] * max_tokens
+        ids = tokenizer.encode(text=sent, add_special_tokens=True)
+        ids = ids[:max_tokens]
+        padded[:len(ids)] = ids
+        attn[:len(ids)]   = [1] * len(ids)
+        out[cat] = (torch.tensor(padded), torch.tensor(attn))
+    return out
 
 
 # ── argument parsing ──────────────────────────────────────────────────────────
@@ -331,8 +356,32 @@ def evaluate(model, data_loader, bert_model):
     return 100 * mIoU_ug, 100 * overall_ug
 
 
+def _forward_model(model, bert_model, image, sentences, attentions, category):
+    """Single forward with optional external BERT."""
+    if bert_model is not None:
+        last_hidden = bert_model(sentences, attention_mask=attentions)[0]
+        embedding   = last_hidden.permute(0, 2, 1)
+        attn_3d     = attentions.unsqueeze(dim=-1)
+        return model(image, embedding, l_mask=attn_3d, category=category)
+    return model(image, sentences, l_mask=attentions, category=category)
+
+
+def _build_wrong_prompt_batch(category_pos, cat_prompt_tokens, device):
+    """For each cat in category_pos, sample a wrong cat (≠ true) and return its tokens."""
+    n = category_pos.shape[0]
+    # offset ∈ {1,2,3} → wrong_cat = ((true-1 + offset) % 4) + 1, never equals true
+    offsets    = torch.randint(1, 4, (n,), device=device)
+    wrong_cats = ((category_pos - 1 + offsets) % 4) + 1                    # (n,)
+    ids_list  = [cat_prompt_tokens[c.item()][0] for c in wrong_cats]
+    attn_list = [cat_prompt_tokens[c.item()][1] for c in wrong_cats]
+    wrong_ids   = torch.stack(ids_list).to(device)                         # (n, T)
+    wrong_attns = torch.stack(attn_list).to(device)                        # (n, T)
+    return wrong_cats, wrong_ids, wrong_attns
+
+
 def train_one_epoch(model, criterion, optimizer, data_loader,
-                    lr_scheduler, epoch, print_freq, iterations, bert_model):
+                    lr_scheduler, epoch, print_freq, iterations, bert_model,
+                    cat_prompt_tokens=None, contrastive_weight=0.5):
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value}'))
@@ -350,22 +399,33 @@ def train_one_epoch(model, criterion, optimizer, data_loader,
         sentences  = sentences.squeeze(1)
         attentions = attentions.squeeze(1)
         category   = meta['category'].cuda()
+        is_pos     = meta['is_pos'].cuda()
 
-        if bert_model is not None:
-            last_hidden_states = bert_model(
-                sentences, attention_mask=attentions)[0]
-            embedding  = last_hidden_states.permute(0, 2, 1)
-            attentions = attentions.unsqueeze(dim=-1)
-            seg_out, exist_out = model(
-                image, embedding, l_mask=attentions, category=category)
-        else:
-            seg_out, exist_out = model(
-                image, sentences, l_mask=attentions, category=category)
-
-        is_pos = meta['is_pos'].cuda()
+        # ── main forward (correct prompt) ────────────────────────────────
+        seg_out, exist_out = _forward_model(
+            model, bert_model, image, sentences, attentions, category)
         loss = criterion(
             seg_out, exist_out, target,
             is_pos=is_pos, category=category, exist_weight=2.0)
+
+        # ── contrastive forward (positive samples + wrong prompt) ───────
+        if cat_prompt_tokens is not None:
+            pos_mask = is_pos.bool()
+            n_pos = pos_mask.sum().item()
+            if n_pos > 0:
+                pos_image    = image[pos_mask]
+                pos_category = category[pos_mask]
+                wrong_cats, wrong_ids, wrong_attns = _build_wrong_prompt_batch(
+                    pos_category, cat_prompt_tokens, image.device)
+                wrong_seg, wrong_exist = _forward_model(
+                    model, bert_model, pos_image, wrong_ids, wrong_attns, wrong_cats)
+                # Wrong prompt → exist=0, target=empty mask (treat as negative)
+                wrong_target = torch.zeros_like(target[pos_mask])
+                wrong_is_pos = torch.zeros(n_pos, device=image.device, dtype=is_pos.dtype)
+                contrastive_loss = criterion(
+                    wrong_seg, wrong_exist, wrong_target,
+                    is_pos=wrong_is_pos, category=wrong_cats, exist_weight=2.0)
+                loss = loss + contrastive_weight * contrastive_loss
 
         # class_embed contrastive: enable from epoch 0, weight up
         single = model.module if hasattr(model, 'module') else model
@@ -421,6 +481,10 @@ def main(args):
         num_workers=args.workers)
 
     print(f'Train: {len(dataset)} slices  |  Val: {len(dataset_val)} slices')
+
+    # Build wrong-prompt token lookup for contrastive forward
+    cat_prompt_tokens = build_cat_prompt_tokens(args.bert_tokenizer, max_tokens=20)
+    print(f'  Contrastive: built {len(cat_prompt_tokens)} category prompt tokens')
 
     print(f'Building model: {args.model}')
     model = segmentation.__dict__[args.model](
@@ -534,7 +598,8 @@ def main(args):
 
         train_one_epoch(
             model, criterion, optimizer, data_loader,
-            lr_scheduler, epoch, args.print_freq, iterations, bert_model)
+            lr_scheduler, epoch, args.print_freq, iterations, bert_model,
+            cat_prompt_tokens=cat_prompt_tokens, contrastive_weight=0.5)
 
         # Validate every val_every epochs (and always on the last epoch)
         if (epoch + 1) % args.val_every != 0 and epoch != args.epochs - 1:
