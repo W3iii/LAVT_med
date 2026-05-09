@@ -23,7 +23,7 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
     --workers 4 \
     --pin_mem \
     --output-dir ./checkpoints/${MODEL_ID} \
-    --neg_ratio 0.1 \
+    --neg_ratio 0.3 \
     --n_soft_tokens 4 \
     --seed 42 \
     2>&1 | tee ./models/${MODEL_ID}/output
