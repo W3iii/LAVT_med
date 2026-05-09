@@ -11,7 +11,7 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
     --model_id ${MODEL_ID} \
     --bert_tokenizer dmis-lab/biobert-base-cased-v1.2 \
     --ck_bert dmis-lab/biobert-base-cased-v1.2 \
-    --data_root ../dataset_2classes \
+    --data_root ../../groups/BME/LN_dataset_2D_vlm_2classes \
     --batch-size 16 \
     --lr 0.000025 \
     --wd 1e-2 \
