@@ -10,4 +10,4 @@ python test.py ^
     --window12 ^
     --img_size 512 ^
     --save_pred ^
-    --output_dir ./pred_results
+    --output_dir ./pred_results/v2_recall_precision_pos_neg
