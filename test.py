@@ -48,28 +48,35 @@ def _center_paste(canvas: np.ndarray, src: np.ndarray) -> None:
 def _save_overlay(image_path: Path, mask_path, pred: torch.Tensor,
                   out_path: Path, canvas_size: int) -> None:
     """
-    Resize pred back to original PNG size, draw GT (green) and pred (red)
-    contours (1-pixel outlines) over the CT image, then center-pad with
-    zeros to canvas_size x canvas_size and save as PNG.
+    Restore the original aspect ratio: scale the longest side to
+    canvas_size, then center-pad the shorter side with zeros. GT (green)
+    and pred (red) 1-pixel contours are drawn on the rescaled CT slice.
     """
     img = Image.open(image_path).convert("L")
     W, H = img.size
-    img_np = np.array(img, dtype=np.uint8)
+
+    scale = canvas_size / max(W, H)
+    new_W = max(1, round(W * scale))
+    new_H = max(1, round(H * scale))
+
+    img_np = np.array(img.resize((new_W, new_H), Image.BILINEAR), dtype=np.uint8)
 
     pred_np = pred.cpu().numpy().astype(np.uint8)
     pred_resized = np.array(
-        Image.fromarray(pred_np).resize((W, H), Image.NEAREST), dtype=np.uint8
+        Image.fromarray(pred_np).resize((new_W, new_H), Image.NEAREST),
+        dtype=np.uint8,
     )
 
     rgb = np.stack([img_np, img_np, img_np], axis=-1)
 
     if mask_path is not None:
-        gt_np = np.array(Image.open(mask_path), dtype=np.uint8)
-        gt_outline = _mask_outline(gt_np)
-        rgb[gt_outline] = (0, 255, 0)
+        gt = Image.open(mask_path)
+        gt_resized = np.array(
+            gt.resize((new_W, new_H), Image.NEAREST), dtype=np.uint8
+        )
+        rgb[_mask_outline(gt_resized)] = (0, 255, 0)
 
-    pred_outline = _mask_outline(pred_resized)
-    rgb[pred_outline] = (255, 0, 0)
+    rgb[_mask_outline(pred_resized)] = (255, 0, 0)
 
     canvas = np.zeros((canvas_size, canvas_size, 3), dtype=np.uint8)
     _center_paste(canvas, rgb)
