@@ -5,11 +5,14 @@ import numpy as np
 import torch
 import torch.utils.data
 from PIL import Image
+from scipy.ndimage import label as cc_label
 
 from lib import segmentation
 from data.dataset_lung_nodule import LungNoduleDataset
 import transforms as T
 import utils
+
+NODULE_IOU_THRS = (0.3, 0.5)
 
 
 def get_transform(args):
@@ -29,6 +32,43 @@ def _mask_outline(mask: np.ndarray) -> np.ndarray:
     eroded = (padded[:-2, 1:-1] & padded[2:, 1:-1] &
               padded[1:-1, :-2] & padded[1:-1, 2:])
     return m & ~eroded
+
+
+def _per_object_iou_matrix(gt_labels: np.ndarray, pred_labels: np.ndarray,
+                           n_gt: int, n_pred: int) -> np.ndarray:
+    """IoU between every GT component and every pred component."""
+    if n_gt == 0 or n_pred == 0:
+        return np.zeros((n_gt, n_pred), dtype=np.float64)
+    flat = gt_labels.ravel().astype(np.int64) * (n_pred + 1) \
+        + pred_labels.ravel().astype(np.int64)
+    bins = np.bincount(flat, minlength=(n_gt + 1) * (n_pred + 1))
+    inter = bins.reshape(n_gt + 1, n_pred + 1)[1:, 1:].astype(np.float64)
+    gt_sizes = np.bincount(gt_labels.ravel(), minlength=n_gt + 1)[1:].astype(np.float64)
+    pred_sizes = np.bincount(pred_labels.ravel(), minlength=n_pred + 1)[1:].astype(np.float64)
+    union = gt_sizes[:, None] + pred_sizes[None, :] - inter
+    return np.where(union > 0, inter / union, 0.0)
+
+
+def _greedy_match(iou_mat: np.ndarray, thr: float) -> tuple:
+    """Match GT/pred pairs greedily by descending IoU at threshold thr."""
+    n_gt, n_pred = iou_mat.shape
+    if n_gt == 0:
+        return 0, 0, n_pred
+    if n_pred == 0:
+        return 0, n_gt, 0
+    pairs_i, pairs_j = np.where(iou_mat >= thr)
+    if pairs_i.size == 0:
+        return 0, n_gt, n_pred
+    order = np.argsort(-iou_mat[pairs_i, pairs_j])
+    pairs_i, pairs_j = pairs_i[order], pairs_j[order]
+    matched_gt = np.zeros(n_gt, dtype=bool)
+    matched_pred = np.zeros(n_pred, dtype=bool)
+    for i, j in zip(pairs_i, pairs_j):
+        if not matched_gt[i] and not matched_pred[j]:
+            matched_gt[i] = True
+            matched_pred[j] = True
+    tp = int(matched_gt.sum())
+    return tp, n_gt - tp, n_pred - int(matched_pred.sum())
 
 
 def _center_paste(canvas: np.ndarray, src: np.ndarray) -> None:
@@ -105,6 +145,11 @@ def evaluate(model, data_loader, device, args):
     cum_union = torch.zeros((), dtype=torch.float64, device=device)
     n_pos, n_neg, n_tn = 0, 0, 0
 
+    # Per-nodule (connected-component) tallies at each IoU threshold,
+    # tracked separately for nodule-only slices vs all slices.
+    cc_all = {thr: [0, 0, 0] for thr in NODULE_IOU_THRS}     # tp, fn, fp
+    cc_nod = {thr: [0, 0, 0] for thr in NODULE_IOU_THRS}
+
     for batch in metric_logger.log_every(data_loader, 100, header):
         if args.save_pred:
             image, target, ann_batch = batch
@@ -154,6 +199,19 @@ def evaluate(model, data_loader, device, args):
             n_tn += int((pred_neg_sum == 0).sum().item())
             n_neg += int(neg.sum().item())
 
+        # Per-nodule (connected-component) match — done on CPU per sample.
+        pred_cpu = pred.cpu().numpy().astype(np.uint8)
+        target_cpu = target.cpu().numpy().astype(np.uint8)
+        for b in range(pred_cpu.shape[0]):
+            gt_labels, n_gt = cc_label(target_cpu[b])
+            pr_labels, n_pred = cc_label(pred_cpu[b])
+            iou_mat = _per_object_iou_matrix(gt_labels, pr_labels, n_gt, n_pred)
+            for thr in NODULE_IOU_THRS:
+                tp, fn, fp = _greedy_match(iou_mat, thr)
+                cc_all[thr][0] += tp; cc_all[thr][1] += fn; cc_all[thr][2] += fp
+                if n_gt > 0:
+                    cc_nod[thr][0] += tp; cc_nod[thr][1] += fn; cc_nod[thr][2] += fp
+
     mean_iou = (torch.cat(iou_chunks).mean().item() if iou_chunks else 0.0) * 100.0
     overall_iou = ((cum_inter / cum_union).item() * 100.0) if cum_union.item() > 0 else 0.0
     tn_rate = (n_tn / n_neg) * 100.0 if n_neg > 0 else 0.0
@@ -165,6 +223,20 @@ def evaluate(model, data_loader, device, args):
     for thr, ok in zip(iou_thresholds, seg_correct):
         prec = (100.0 * ok / n_pos) if n_pos > 0 else 0.0
         print(f'  precision@{thr:.1f}: {prec:.2f}')
+
+    def _format(tag: str, table: dict) -> None:
+        print(f'\nPer-nodule metrics ({tag}):')
+        print(f'  {"thr":>4} | {"TP":>5} {"FN":>5} {"FP":>5} | '
+              f'{"Recall":>7} {"Precision":>9}')
+        for thr in NODULE_IOU_THRS:
+            tp, fn, fp = table[thr]
+            recall = (100.0 * tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+            precision = (100.0 * tp / (tp + fp)) if (tp + fp) > 0 else 0.0
+            print(f'  {thr:>4.2f} | {tp:>5d} {fn:>5d} {fp:>5d} | '
+                  f'{recall:>6.2f}% {precision:>8.2f}%')
+
+    _format('nodule slices only', cc_nod)
+    _format('including normal slices', cc_all)
 
 
 def main(args):
