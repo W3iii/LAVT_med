@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -19,13 +20,60 @@ def get_transform(args):
     ])
 
 
-def _save_predictions(pred: torch.Tensor, ann_batch: dict, pred_dir: str) -> None:
-    # pred: (B, H, W) {0, 1}; ann_batch: dict-of-lists from default collate.
-    images = ann_batch["image"]
-    pred_np = (pred.cpu().numpy().astype(np.uint8) * 255)
-    for i, fname in enumerate(images):
-        stem = os.path.splitext(fname)[0]
-        Image.fromarray(pred_np[i]).save(os.path.join(pred_dir, f"{stem}_pred.png"))
+def _mask_outline(mask: np.ndarray) -> np.ndarray:
+    """1-pixel boundary of a binary mask via 4-connected erosion."""
+    m = mask.astype(bool)
+    if not m.any():
+        return np.zeros_like(m)
+    padded = np.pad(m, 1, mode='constant', constant_values=False)
+    eroded = (padded[:-2, 1:-1] & padded[2:, 1:-1] &
+              padded[1:-1, :-2] & padded[1:-1, 2:])
+    return m & ~eroded
+
+
+def _center_paste(canvas: np.ndarray, src: np.ndarray) -> None:
+    """Center-paste src into canvas in-place. Crops src if it exceeds canvas."""
+    ch, cw = canvas.shape[:2]
+    sh, sw = src.shape[:2]
+    h_use = min(sh, ch)
+    w_use = min(sw, cw)
+    top = (ch - h_use) // 2
+    left = (cw - w_use) // 2
+    src_top = (sh - h_use) // 2
+    src_left = (sw - w_use) // 2
+    canvas[top:top + h_use, left:left + w_use] = \
+        src[src_top:src_top + h_use, src_left:src_left + w_use]
+
+
+def _save_overlay(image_path: Path, mask_path, pred: torch.Tensor,
+                  out_path: Path, canvas_size: int) -> None:
+    """
+    Resize pred back to original PNG size, draw GT (green) and pred (red)
+    contours (1-pixel outlines) over the CT image, then center-pad with
+    zeros to canvas_size x canvas_size and save as PNG.
+    """
+    img = Image.open(image_path).convert("L")
+    W, H = img.size
+    img_np = np.array(img, dtype=np.uint8)
+
+    pred_np = pred.cpu().numpy().astype(np.uint8)
+    pred_resized = np.array(
+        Image.fromarray(pred_np).resize((W, H), Image.NEAREST), dtype=np.uint8
+    )
+
+    rgb = np.stack([img_np, img_np, img_np], axis=-1)
+
+    if mask_path is not None:
+        gt_np = np.array(Image.open(mask_path), dtype=np.uint8)
+        gt_outline = _mask_outline(gt_np)
+        rgb[gt_outline] = (0, 255, 0)
+
+    pred_outline = _mask_outline(pred_resized)
+    rgb[pred_outline] = (255, 0, 0)
+
+    canvas = np.zeros((canvas_size, canvas_size, 3), dtype=np.uint8)
+    _center_paste(canvas, rgb)
+    Image.fromarray(canvas).save(out_path)
 
 
 @torch.no_grad()
@@ -35,8 +83,12 @@ def evaluate(model, data_loader, device, args):
     header = 'Test:'
 
     if args.save_pred:
-        os.makedirs(args.pred_dir, exist_ok=True)
-        print(f'Saving predictions to {args.pred_dir}')
+        pred_root = Path(args.pred_dir)
+        (pred_root / "nodule").mkdir(parents=True, exist_ok=True)
+        (pred_root / "normal").mkdir(parents=True, exist_ok=True)
+        images_dir = Path(args.data_root) / "images" / args.split
+        masks_dir = Path(args.data_root) / "masks" / args.split
+        print(f'Saving overlays to {pred_root}/{{nodule,normal}}')
 
     iou_thresholds = [0.5, 0.6, 0.7, 0.8, 0.9]
     seg_correct = np.zeros(len(iou_thresholds), dtype=np.int64)
@@ -56,11 +108,20 @@ def evaluate(model, data_loader, device, args):
         image = image.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
 
-        logits = model(image)                          # (B, 2, H, W)
+        logits = model(image)
         pred = logits.argmax(dim=1)                    # (B, H, W) {0, 1}
 
         if args.save_pred:
-            _save_predictions(pred, ann_batch, args.pred_dir)
+            for i in range(pred.shape[0]):
+                img_name = ann_batch["image"][i]
+                mask_name = ann_batch["mask"][i]
+                is_normal = (mask_name == "empty")
+                subdir = "normal" if is_normal else "nodule"
+                stem = os.path.splitext(img_name)[0]
+                out_path = pred_root / subdir / f"{stem}_overlay.png"
+                gt_path = None if is_normal else (masks_dir / mask_name)
+                _save_overlay(images_dir / img_name, gt_path,
+                              pred[i], out_path, args.img_size)
 
         target_flat = target.flatten(1)
         pred_flat = pred.flatten(1)
