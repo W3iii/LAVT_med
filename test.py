@@ -129,22 +129,20 @@ def evaluate(model, data_loader, device, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
 
-    pred_root = None
     if args.save_pred:
         pred_root = Path(args.pred_dir)
         (pred_root / "nodule").mkdir(parents=True, exist_ok=True)
         (pred_root / "normal").mkdir(parents=True, exist_ok=True)
+        images_dir = Path(args.data_root) / "images" / args.split
+        masks_dir = Path(args.data_root) / "masks" / args.split
         print(f'Saving overlays to {pred_root}/{{nodule,normal}}')
-
-    images_dir = Path(args.data_root) / "images" / args.split
-    masks_dir = Path(args.data_root) / "masks" / args.split
 
     iou_thresholds = [0.5, 0.6, 0.7, 0.8, 0.9]
     seg_correct = np.zeros(len(iou_thresholds), dtype=np.int64)
 
-    iou_pos_list = []
-    cum_inter = 0
-    cum_union = 0
+    iou_chunks = []
+    cum_inter = torch.zeros((), dtype=torch.float64, device=device)
+    cum_union = torch.zeros((), dtype=torch.float64, device=device)
     n_pos, n_neg, n_tn = 0, 0, 0
 
     # Per-nodule (connected-component) tallies at each IoU threshold,
@@ -152,80 +150,70 @@ def evaluate(model, data_loader, device, args):
     cc_all = {thr: [0, 0, 0] for thr in NODULE_IOU_THRS}     # tp, fn, fp
     cc_nod = {thr: [0, 0, 0] for thr in NODULE_IOU_THRS}
 
-    for image, target, ann_batch in metric_logger.log_every(
-            data_loader, 100, header):
+    for batch in metric_logger.log_every(data_loader, 100, header):
+        if args.save_pred:
+            image, target, ann_batch = batch
+        else:
+            image, target = batch
+            ann_batch = None
+
         image = image.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
 
         logits = model(image)
-        pred = logits.argmax(dim=1)                            # (B, h, w) at img_size
-        pred_cpu = pred.cpu().numpy().astype(np.uint8)
+        pred = logits.argmax(dim=1)                    # (B, H, W) {0, 1}
 
-        # Metrics in original resolution: resize pred back to native (W, H)
-        # and compare against the on-disk GT mask at native size.
-        for b in range(pred_cpu.shape[0]):
-            img_name = ann_batch["image"][b]
-            mask_name = ann_batch["mask"][b]
-            is_normal = (mask_name == "empty")
-            img_path = images_dir / img_name
-
-            with Image.open(img_path) as im:
-                W_orig, H_orig = im.size
-
-            if is_normal:
-                gt_orig = np.zeros((H_orig, W_orig), dtype=np.uint8)
-            else:
-                gt_orig = np.array(Image.open(masks_dir / mask_name),
-                                   dtype=np.uint8)
-                gt_orig = (gt_orig > 0).astype(np.uint8)
-
-            pred_orig = np.array(
-                Image.fromarray(pred_cpu[b]).resize(
-                    (W_orig, H_orig), Image.NEAREST),
-                dtype=np.uint8,
-            )
-
-            inter = int(np.logical_and(pred_orig, gt_orig).sum())
-            gt_sum = int(gt_orig.sum())
-            pred_sum = int(pred_orig.sum())
-            union = pred_sum + gt_sum - inter
-
-            if gt_sum > 0:
-                iou = (inter / union) if union > 0 else 0.0
-                iou_pos_list.append(iou)
-                cum_inter += inter
-                cum_union += union
-                n_pos += 1
-                for k, thr in enumerate(iou_thresholds):
-                    if iou >= thr:
-                        seg_correct[k] += 1
-            else:
-                n_neg += 1
-                if pred_sum == 0:
-                    n_tn += 1
-
-            gt_labels, n_gt = cc_label(gt_orig)
-            pr_labels, n_pred = cc_label(pred_orig)
-            iou_mat = _per_object_iou_matrix(gt_labels, pr_labels, n_gt, n_pred)
-            for thr in NODULE_IOU_THRS:
-                tp, fn, fp = _greedy_match(iou_mat, thr)
-                cc_all[thr][0] += tp
-                cc_all[thr][1] += fn
-                cc_all[thr][2] += fp
-                if n_gt > 0:
-                    cc_nod[thr][0] += tp
-                    cc_nod[thr][1] += fn
-                    cc_nod[thr][2] += fp
-
-            if args.save_pred:
+        if args.save_pred:
+            for i in range(pred.shape[0]):
+                img_name = ann_batch["image"][i]
+                mask_name = ann_batch["mask"][i]
+                is_normal = (mask_name == "empty")
                 subdir = "normal" if is_normal else "nodule"
                 stem = os.path.splitext(img_name)[0]
                 out_path = pred_root / subdir / f"{stem}_overlay.png"
                 gt_path = None if is_normal else (masks_dir / mask_name)
-                _save_overlay(img_path, gt_path, pred[b],
-                              out_path, args.img_size)
+                _save_overlay(images_dir / img_name, gt_path,
+                              pred[i], out_path, args.img_size)
 
-    mean_iou = (float(np.mean(iou_pos_list)) * 100.0) if iou_pos_list else 0.0
-    overall_iou = (cum_inter / cum_union * 100.0) if cum_union > 0 else 0.0
+        target_flat = target.flatten(1)
+        pred_flat = pred.flatten(1)
+        is_pos = target_flat.any(dim=1)
+
+        inter = (pred_flat * target_flat).sum(dim=1).double()
+        union = (pred_flat.sum(dim=1) + target_flat.sum(dim=1)).double() - inter
+        iou = torch.where(union > 0, inter / union, torch.zeros_like(inter))
+
+        if is_pos.any():
+            iou_pos = iou[is_pos]
+            iou_chunks.append(iou_pos.cpu())
+            cum_inter += inter[is_pos].sum()
+            cum_union += union[is_pos].sum()
+            n_pos += int(is_pos.sum().item())
+            iou_np = iou_pos.cpu().numpy()
+            for k, thr in enumerate(iou_thresholds):
+                seg_correct[k] += int((iou_np >= thr).sum())
+
+        neg = ~is_pos
+        if neg.any():
+            pred_neg_sum = pred_flat[neg].sum(dim=1)
+            n_tn += int((pred_neg_sum == 0).sum().item())
+            n_neg += int(neg.sum().item())
+
+        # Per-nodule (connected-component) match — done on CPU per sample.
+        pred_cpu = pred.cpu().numpy().astype(np.uint8)
+        target_cpu = target.cpu().numpy().astype(np.uint8)
+        for b in range(pred_cpu.shape[0]):
+            gt_labels, n_gt = cc_label(target_cpu[b])
+            pr_labels, n_pred = cc_label(pred_cpu[b])
+            iou_mat = _per_object_iou_matrix(gt_labels, pr_labels, n_gt, n_pred)
+            for thr in NODULE_IOU_THRS:
+                tp, fn, fp = _greedy_match(iou_mat, thr)
+                cc_all[thr][0] += tp; cc_all[thr][1] += fn; cc_all[thr][2] += fp
+                if n_gt > 0:
+                    cc_nod[thr][0] += tp; cc_nod[thr][1] += fn; cc_nod[thr][2] += fp
+
+    mean_iou = (torch.cat(iou_chunks).mean().item() if iou_chunks else 0.0) * 100.0
+    overall_iou = ((cum_inter / cum_union).item() * 100.0) if cum_union.item() > 0 else 0.0
     tn_rate = (n_tn / n_neg) * 100.0 if n_neg > 0 else 0.0
 
     print('Final results:')
@@ -260,7 +248,7 @@ def main(args):
         transforms=get_transform(args),
         neg_ratio=args.neg_ratio,
         seed=args.seed,
-        return_meta=True,  # always — metrics now run at the original PNG resolution
+        return_meta=args.save_pred,
     )
     data_loader = torch.utils.data.DataLoader(
         dataset_test, batch_size=args.batch_size, shuffle=False,
