@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 
@@ -50,25 +51,30 @@ def _per_object_iou_matrix(gt_labels: np.ndarray, pred_labels: np.ndarray,
 
 
 def _greedy_match(iou_mat: np.ndarray, thr: float) -> tuple:
-    """Match GT/pred pairs greedily by descending IoU at threshold thr."""
+    """Match GT/pred pairs greedily by descending IoU at threshold thr.
+
+    Returns (tp, fn, fp, matched_gt, matched_pred). matched_gt/matched_pred
+    are bool arrays marking which GT/pred components got matched (useful
+    for per-component TP/FP labeling).
+    """
     n_gt, n_pred = iou_mat.shape
-    if n_gt == 0:
-        return 0, 0, n_pred
-    if n_pred == 0:
-        return 0, n_gt, 0
-    pairs_i, pairs_j = np.where(iou_mat >= thr)
-    if pairs_i.size == 0:
-        return 0, n_gt, n_pred
-    order = np.argsort(-iou_mat[pairs_i, pairs_j])
-    pairs_i, pairs_j = pairs_i[order], pairs_j[order]
     matched_gt = np.zeros(n_gt, dtype=bool)
     matched_pred = np.zeros(n_pred, dtype=bool)
+    if n_gt == 0:
+        return 0, 0, n_pred, matched_gt, matched_pred
+    if n_pred == 0:
+        return 0, n_gt, 0, matched_gt, matched_pred
+    pairs_i, pairs_j = np.where(iou_mat >= thr)
+    if pairs_i.size == 0:
+        return 0, n_gt, n_pred, matched_gt, matched_pred
+    order = np.argsort(-iou_mat[pairs_i, pairs_j])
+    pairs_i, pairs_j = pairs_i[order], pairs_j[order]
     for i, j in zip(pairs_i, pairs_j):
         if not matched_gt[i] and not matched_pred[j]:
             matched_gt[i] = True
             matched_pred[j] = True
     tp = int(matched_gt.sum())
-    return tp, n_gt - tp, n_pred - int(matched_pred.sum())
+    return tp, n_gt - tp, n_pred - int(matched_pred.sum()), matched_gt, matched_pred
 
 
 def _center_paste(canvas: np.ndarray, src: np.ndarray) -> None:
@@ -137,6 +143,10 @@ def evaluate(model, data_loader, device, args):
         masks_dir = Path(args.data_root) / "masks" / args.split
         print(f'Saving overlays to {pred_root}/{{nodule,normal}}')
 
+    dump_cc = bool(args.cc_stats_json)
+    cc_stats_slices: list = [] if dump_cc else []
+    want_meta = args.save_pred or dump_cc
+
     iou_thresholds = [0.5, 0.6, 0.7, 0.8, 0.9]
     seg_correct = np.zeros(len(iou_thresholds), dtype=np.int64)
 
@@ -151,7 +161,7 @@ def evaluate(model, data_loader, device, args):
     cc_nod = {thr: [0, 0, 0] for thr in NODULE_IOU_THRS}
 
     for batch in metric_logger.log_every(data_loader, 100, header):
-        if args.save_pred:
+        if want_meta:
             image, target, ann_batch = batch
         else:
             image, target = batch
@@ -206,11 +216,43 @@ def evaluate(model, data_loader, device, args):
             gt_labels, n_gt = cc_label(target_cpu[b])
             pr_labels, n_pred = cc_label(pred_cpu[b])
             iou_mat = _per_object_iou_matrix(gt_labels, pr_labels, n_gt, n_pred)
+            per_thr_match = {}
             for thr in NODULE_IOU_THRS:
-                tp, fn, fp = _greedy_match(iou_mat, thr)
+                tp, fn, fp, mg, mp = _greedy_match(iou_mat, thr)
                 cc_all[thr][0] += tp; cc_all[thr][1] += fn; cc_all[thr][2] += fp
                 if n_gt > 0:
                     cc_nod[thr][0] += tp; cc_nod[thr][1] += fn; cc_nod[thr][2] += fp
+                per_thr_match[thr] = (mg, mp)
+
+            if dump_cc:
+                gt_sizes = np.bincount(gt_labels.ravel(),
+                                       minlength=n_gt + 1)[1:].astype(int).tolist()
+                pred_sizes = np.bincount(pr_labels.ravel(),
+                                         minlength=n_pred + 1)[1:].astype(int).tolist()
+                gt_best_iou = (iou_mat.max(axis=1).tolist()
+                               if n_gt > 0 and n_pred > 0 else [0.0] * n_gt)
+                pred_best_iou = (iou_mat.max(axis=0).tolist()
+                                 if n_gt > 0 and n_pred > 0 else [0.0] * n_pred)
+                ann = ann_batch
+                img_name = ann["image"][b] if ann is not None else ""
+                mask_name = ann["mask"][b] if ann is not None else ""
+                cc_stats_slices.append({
+                    "image": img_name,
+                    "mask": mask_name,
+                    "is_normal": mask_name == "empty",
+                    "gt_sizes": gt_sizes,
+                    "pred_sizes": pred_sizes,
+                    "gt_best_iou": [round(float(v), 4) for v in gt_best_iou],
+                    "pred_best_iou": [round(float(v), 4) for v in pred_best_iou],
+                    "gt_matched": {
+                        f"{thr:g}": per_thr_match[thr][0].tolist()
+                        for thr in NODULE_IOU_THRS
+                    },
+                    "pred_matched": {
+                        f"{thr:g}": per_thr_match[thr][1].tolist()
+                        for thr in NODULE_IOU_THRS
+                    },
+                })
 
     mean_iou = (torch.cat(iou_chunks).mean().item() if iou_chunks else 0.0) * 100.0
     overall_iou = ((cum_inter / cum_union).item() * 100.0) if cum_union.item() > 0 else 0.0
@@ -238,6 +280,19 @@ def evaluate(model, data_loader, device, args):
     _format('nodule slices only', cc_nod)
     _format('including normal slices', cc_all)
 
+    if dump_cc:
+        out_path = Path(args.cc_stats_json)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "img_size": args.img_size,
+            "thresholds": list(NODULE_IOU_THRS),
+            "slices": cc_stats_slices,
+        }
+        with open(out_path, "w") as f:
+            json.dump(payload, f)
+        print(f'\nWrote per-slice CC stats to {out_path} '
+              f'({len(cc_stats_slices)} slices)')
+
 
 def main(args):
     device = torch.device(args.device)
@@ -248,7 +303,7 @@ def main(args):
         transforms=get_transform(args),
         neg_ratio=args.neg_ratio,
         seed=args.seed,
-        return_meta=args.save_pred,
+        return_meta=args.save_pred or bool(args.cc_stats_json),
     )
     data_loader = torch.utils.data.DataLoader(
         dataset_test, batch_size=args.batch_size, shuffle=False,

@@ -20,6 +20,7 @@ python test.py ^
     --n_soft_tokens 4 ^
     --resume %CKPT% ^
     --save_pred ^
+    --cc_stats_json .\pred_results\%MODEL_ID%\cc_stats.json ^
     --pred_dir .\pred_results\%MODEL_ID%
 
 endlocal

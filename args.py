@@ -34,6 +34,9 @@ def get_parser():
                         help='where test.py writes prediction masks when --save_pred is set')
     parser.add_argument('--save_pred', action='store_true',
                         help='if set, test.py saves per-sample predicted masks as PNG')
+    parser.add_argument('--cc_stats_json', default='',
+                        help='if set, test.py writes per-slice CC sizes + TP/FP labels '
+                             'to this JSON path for downstream FP-size analysis')
     parser.add_argument('--pin_mem', action='store_true',
                         help='If true, pin memory when using the data loader.')
     parser.add_argument('--pretrained_swin_weights', default='',
