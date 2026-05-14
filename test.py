@@ -16,11 +16,23 @@ import utils
 NODULE_DICE_THRS = (0.3, 0.5)
 
 
+def get_input_size(args):
+    if args.img_size is not None:
+        return args.img_size, args.img_size
+    return args.img_h, args.img_w
+
+
+def format_input_size(args):
+    img_h, img_w = get_input_size(args)
+    return f'{img_w}x{img_h} (W x H)'
+
+
 def get_transform(args):
+    img_h, img_w = get_input_size(args)
     return T.Compose([
-        T.Resize(args.img_size, args.img_size),
+        T.PadOrCropToSize(img_h, img_w, image_fill=0, target_fill=0),
         T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        T.Clip01(),
     ])
 
 
@@ -77,56 +89,35 @@ def _greedy_match(score_mat: np.ndarray, thr: float) -> tuple:
     return tp, n_gt - tp, n_pred - int(matched_pred.sum()), matched_gt, matched_pred
 
 
-def _center_paste(canvas: np.ndarray, src: np.ndarray) -> None:
-    """Center-paste src into canvas in-place. Crops src if it exceeds canvas."""
-    ch, cw = canvas.shape[:2]
-    sh, sw = src.shape[:2]
-    h_use = min(sh, ch)
-    w_use = min(sw, cw)
-    top = (ch - h_use) // 2
-    left = (cw - w_use) // 2
-    src_top = (sh - h_use) // 2
-    src_left = (sw - w_use) // 2
-    canvas[top:top + h_use, left:left + w_use] = \
-        src[src_top:src_top + h_use, src_left:src_left + w_use]
-
-
 def _save_overlay(image_path: Path, mask_path, pred: torch.Tensor,
-                  out_path: Path, canvas_size: int) -> None:
+                  out_path: Path, output_size: tuple) -> None:
     """
-    Restore the original aspect ratio: scale the longest side to
-    canvas_size, then center-pad the shorter side with zeros. GT (green)
-    and pred (red) 1-pixel contours are drawn on the rescaled CT slice.
+    Draw GT (green) and pred (red) contours on the same deterministic
+    pad/crop canvas used by validation/test transforms.
     """
+    out_h, out_w = output_size
     img = Image.open(image_path).convert("L")
-    W, H = img.size
+    if mask_path is None:
+        gt = Image.new("L", img.size, 0)
+    else:
+        gt = Image.open(mask_path).convert("L")
 
-    scale = canvas_size / max(W, H)
-    new_W = max(1, round(W * scale))
-    new_H = max(1, round(H * scale))
+    fit = T.PadOrCropToSize(out_h, out_w, image_fill=0, target_fill=0)
+    img, gt = fit(img, gt)
 
-    img_np = np.array(img.resize((new_W, new_H), Image.BILINEAR), dtype=np.uint8)
-
+    img_np = np.array(img, dtype=np.uint8)
+    gt_np = np.array(gt, dtype=np.uint8)
     pred_np = pred.cpu().numpy().astype(np.uint8)
-    pred_resized = np.array(
-        Image.fromarray(pred_np).resize((new_W, new_H), Image.NEAREST),
-        dtype=np.uint8,
-    )
+    if pred_np.shape != (out_h, out_w):
+        pred_np = np.array(
+            Image.fromarray(pred_np).resize((out_w, out_h), Image.NEAREST),
+            dtype=np.uint8,
+        )
 
     rgb = np.stack([img_np, img_np, img_np], axis=-1)
-
-    if mask_path is not None:
-        gt = Image.open(mask_path)
-        gt_resized = np.array(
-            gt.resize((new_W, new_H), Image.NEAREST), dtype=np.uint8
-        )
-        rgb[_mask_outline(gt_resized)] = (0, 255, 0)
-
-    rgb[_mask_outline(pred_resized)] = (255, 0, 0)
-
-    canvas = np.zeros((canvas_size, canvas_size, 3), dtype=np.uint8)
-    _center_paste(canvas, rgb)
-    Image.fromarray(canvas).save(out_path)
+    rgb[_mask_outline(gt_np)] = (0, 255, 0)
+    rgb[_mask_outline(pred_np)] = (255, 0, 0)
+    Image.fromarray(rgb).save(out_path)
 
 
 @torch.no_grad()
@@ -134,6 +125,7 @@ def evaluate(model, data_loader, device, args):
     model.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
+    output_size = get_input_size(args)
 
     if args.save_pred:
         pred_root = Path(args.pred_dir)
@@ -183,7 +175,7 @@ def evaluate(model, data_loader, device, args):
                 out_path = pred_root / subdir / f"{stem}_overlay.png"
                 gt_path = None if is_normal else (masks_dir / mask_name)
                 _save_overlay(images_dir / img_name, gt_path,
-                              pred[i], out_path, args.img_size)
+                              pred[i], out_path, output_size)
 
         target_flat = target.flatten(1)
         pred_flat = pred.flatten(1)
@@ -283,8 +275,11 @@ def evaluate(model, data_loader, device, args):
     if dump_cc:
         out_path = Path(args.cc_stats_json)
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        img_h, img_w = output_size
         payload = {
-            "img_size": args.img_size,
+            "img_size": f"{img_w}x{img_h}",
+            "img_h": img_h,
+            "img_w": img_w,
             "match_metric": "dice",
             "thresholds": list(NODULE_DICE_THRS),
             "slices": cc_stats_slices,
@@ -328,5 +323,5 @@ if __name__ == "__main__":
     from args import get_parser
     parser = get_parser()
     args = parser.parse_args()
-    print(f'Image size: {args.img_size}')
+    print(f'Image size: {format_input_size(args)}')
     main(args)

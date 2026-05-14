@@ -16,7 +16,12 @@ def get_parser():
     parser.add_argument('--device', default='cuda:0', help='device')  # only used when testing on a single machine
     parser.add_argument('--epochs', default=40, type=int, metavar='N', help='number of total epochs to run')
     parser.add_argument('--fusion_drop', default=0.0, type=float, help='dropout rate for PWAMs')
-    parser.add_argument('--img_size', default=480, type=int, help='input image size')
+    parser.add_argument('--img_size', default=None, type=int,
+                        help='deprecated square input size; use --img_h/--img_w for rectangular CT input')
+    parser.add_argument('--img_h', default=384, type=int,
+                        help='input image height after pad/crop')
+    parser.add_argument('--img_w', default=512, type=int,
+                        help='input image width after pad/crop')
     parser.add_argument("--local_rank", type=int, default=-1,
                         help='local rank for DistributedDataParallel; -1 = single-GPU mode')
     parser.add_argument('--lr', default=0.00005, type=float, help='the initial learning rate')

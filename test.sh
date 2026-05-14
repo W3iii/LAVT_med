@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_ID=lavt_one_ln_v1
+MODEL_ID=lavt_one_ln_v1_augment
 CKPT=./checkpoints/${MODEL_ID}/model_best_${MODEL_ID}.pth
 
 CUDA_VISIBLE_DEVICES=0 python test.py \
@@ -14,7 +14,8 @@ CUDA_VISIBLE_DEVICES=0 python test.py \
     --swin_type base \
     --pretrained_swin_weights ./pretrained_weights/swin_base_patch4_window12_384_22k.pth \
     --window12 \
-    --img_size 512 \
+    --img_h 384 \
+    --img_w 512 \
     --workers 4 \
     --pin_mem \
     --neg_ratio=-1 \

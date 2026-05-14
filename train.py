@@ -16,12 +16,42 @@ import transforms as T
 import utils
 
 
-def get_transform(args):
-    return T.Compose([
-        T.Resize(args.img_size, args.img_size),
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+def get_input_size(args):
+    if args.img_size is not None:
+        return args.img_size, args.img_size
+    return args.img_h, args.img_w
+
+
+def format_input_size(args):
+    img_h, img_w = get_input_size(args)
+    return f'{img_w}x{img_h} (W x H)'
+
+
+def get_transform(args, is_train: bool):
+    img_h, img_w = get_input_size(args)
+    transforms = [
+        T.PadOrCropToSize(img_h, img_w, image_fill=0, target_fill=0),
+    ]
+    if is_train:
+        transforms.extend([
+            T.RandomHorizontalFlip(0.5),
+            T.RandomVerticalFlip(0.3),
+            T.RandomMildAffine(prob=0.5, degrees=7.0,
+                               translate_px=10,
+                               scale_range=(0.95, 1.05)),
+            T.RandomGaussianBlur(prob=0.1, sigma_max=0.5),
+        ])
+    transforms.append(T.ToTensor())
+    if is_train:
+        transforms.extend([
+            T.RandomIntensityShiftScale(shift=0.05, scale=0.1,
+                                        shift_prob=0.5,
+                                        scale_prob=0.5),
+            T.RandomGaussianNoise(prob=0.3, std=0.015),
+        ])
+    else:
+        transforms.append(T.Clip01())
+    return T.Compose(transforms)
 
 
 def get_dataset(split, transform, args):
@@ -147,11 +177,11 @@ def main(args):
         if args.model_id:
             utils.mkdir(os.path.join('./models/', args.model_id))
 
-    print(f'Image size: {args.img_size}')
+    print(f'Image size: {format_input_size(args)}')
     print(f'Distributed: {distributed}')
 
-    dataset_train = get_dataset('train', get_transform(args), args)
-    dataset_val = get_dataset('val', get_transform(args), args)
+    dataset_train = get_dataset('train', get_transform(args, is_train=True), args)
+    dataset_val = get_dataset('val', get_transform(args, is_train=False), args)
 
     if distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(
