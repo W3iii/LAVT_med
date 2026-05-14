@@ -13,7 +13,7 @@ from data.dataset_lung_nodule import LungNoduleDataset
 import transforms as T
 import utils
 
-NODULE_IOU_THRS = (0.3, 0.5)
+NODULE_DICE_THRS = (0.3, 0.5)
 
 
 def get_transform(args):
@@ -35,9 +35,9 @@ def _mask_outline(mask: np.ndarray) -> np.ndarray:
     return m & ~eroded
 
 
-def _per_object_iou_matrix(gt_labels: np.ndarray, pred_labels: np.ndarray,
-                           n_gt: int, n_pred: int) -> np.ndarray:
-    """IoU between every GT component and every pred component."""
+def _per_object_dice_matrix(gt_labels: np.ndarray, pred_labels: np.ndarray,
+                            n_gt: int, n_pred: int) -> np.ndarray:
+    """Dice between every GT component and every pred component."""
     if n_gt == 0 or n_pred == 0:
         return np.zeros((n_gt, n_pred), dtype=np.float64)
     flat = gt_labels.ravel().astype(np.int64) * (n_pred + 1) \
@@ -46,28 +46,28 @@ def _per_object_iou_matrix(gt_labels: np.ndarray, pred_labels: np.ndarray,
     inter = bins.reshape(n_gt + 1, n_pred + 1)[1:, 1:].astype(np.float64)
     gt_sizes = np.bincount(gt_labels.ravel(), minlength=n_gt + 1)[1:].astype(np.float64)
     pred_sizes = np.bincount(pred_labels.ravel(), minlength=n_pred + 1)[1:].astype(np.float64)
-    union = gt_sizes[:, None] + pred_sizes[None, :] - inter
-    return np.where(union > 0, inter / union, 0.0)
+    denom = gt_sizes[:, None] + pred_sizes[None, :]
+    return np.where(denom > 0, 2.0 * inter / denom, 0.0)
 
 
-def _greedy_match(iou_mat: np.ndarray, thr: float) -> tuple:
-    """Match GT/pred pairs greedily by descending IoU at threshold thr.
+def _greedy_match(score_mat: np.ndarray, thr: float) -> tuple:
+    """Match GT/pred pairs greedily by descending score at threshold thr.
 
-    Returns (tp, fn, fp, matched_gt, matched_pred). matched_gt/matched_pred
-    are bool arrays marking which GT/pred components got matched (useful
-    for per-component TP/FP labeling).
+    The score matrix can be IoU, Dice, or any overlap measure. Returns
+    (tp, fn, fp, matched_gt, matched_pred); the boolean arrays mark which
+    GT/pred components got paired.
     """
-    n_gt, n_pred = iou_mat.shape
+    n_gt, n_pred = score_mat.shape
     matched_gt = np.zeros(n_gt, dtype=bool)
     matched_pred = np.zeros(n_pred, dtype=bool)
     if n_gt == 0:
         return 0, 0, n_pred, matched_gt, matched_pred
     if n_pred == 0:
         return 0, n_gt, 0, matched_gt, matched_pred
-    pairs_i, pairs_j = np.where(iou_mat >= thr)
+    pairs_i, pairs_j = np.where(score_mat >= thr)
     if pairs_i.size == 0:
         return 0, n_gt, n_pred, matched_gt, matched_pred
-    order = np.argsort(-iou_mat[pairs_i, pairs_j])
+    order = np.argsort(-score_mat[pairs_i, pairs_j])
     pairs_i, pairs_j = pairs_i[order], pairs_j[order]
     for i, j in zip(pairs_i, pairs_j):
         if not matched_gt[i] and not matched_pred[j]:
@@ -155,10 +155,10 @@ def evaluate(model, data_loader, device, args):
     cum_union = torch.zeros((), dtype=torch.float64, device=device)
     n_pos, n_neg, n_tn = 0, 0, 0
 
-    # Per-nodule (connected-component) tallies at each IoU threshold,
+    # Per-nodule (connected-component) tallies at each Dice threshold,
     # tracked separately for nodule-only slices vs all slices.
-    cc_all = {thr: [0, 0, 0] for thr in NODULE_IOU_THRS}     # tp, fn, fp
-    cc_nod = {thr: [0, 0, 0] for thr in NODULE_IOU_THRS}
+    cc_all = {thr: [0, 0, 0] for thr in NODULE_DICE_THRS}    # tp, fn, fp
+    cc_nod = {thr: [0, 0, 0] for thr in NODULE_DICE_THRS}
 
     for batch in metric_logger.log_every(data_loader, 100, header):
         if want_meta:
@@ -215,10 +215,10 @@ def evaluate(model, data_loader, device, args):
         for b in range(pred_cpu.shape[0]):
             gt_labels, n_gt = cc_label(target_cpu[b])
             pr_labels, n_pred = cc_label(pred_cpu[b])
-            iou_mat = _per_object_iou_matrix(gt_labels, pr_labels, n_gt, n_pred)
+            dice_mat = _per_object_dice_matrix(gt_labels, pr_labels, n_gt, n_pred)
             per_thr_match = {}
-            for thr in NODULE_IOU_THRS:
-                tp, fn, fp, mg, mp = _greedy_match(iou_mat, thr)
+            for thr in NODULE_DICE_THRS:
+                tp, fn, fp, mg, mp = _greedy_match(dice_mat, thr)
                 cc_all[thr][0] += tp; cc_all[thr][1] += fn; cc_all[thr][2] += fp
                 if n_gt > 0:
                     cc_nod[thr][0] += tp; cc_nod[thr][1] += fn; cc_nod[thr][2] += fp
@@ -229,10 +229,10 @@ def evaluate(model, data_loader, device, args):
                                        minlength=n_gt + 1)[1:].astype(int).tolist()
                 pred_sizes = np.bincount(pr_labels.ravel(),
                                          minlength=n_pred + 1)[1:].astype(int).tolist()
-                gt_best_iou = (iou_mat.max(axis=1).tolist()
-                               if n_gt > 0 and n_pred > 0 else [0.0] * n_gt)
-                pred_best_iou = (iou_mat.max(axis=0).tolist()
-                                 if n_gt > 0 and n_pred > 0 else [0.0] * n_pred)
+                gt_best_dice = (dice_mat.max(axis=1).tolist()
+                                if n_gt > 0 and n_pred > 0 else [0.0] * n_gt)
+                pred_best_dice = (dice_mat.max(axis=0).tolist()
+                                  if n_gt > 0 and n_pred > 0 else [0.0] * n_pred)
                 ann = ann_batch
                 img_name = ann["image"][b] if ann is not None else ""
                 mask_name = ann["mask"][b] if ann is not None else ""
@@ -242,15 +242,15 @@ def evaluate(model, data_loader, device, args):
                     "is_normal": mask_name == "empty",
                     "gt_sizes": gt_sizes,
                     "pred_sizes": pred_sizes,
-                    "gt_best_iou": [round(float(v), 4) for v in gt_best_iou],
-                    "pred_best_iou": [round(float(v), 4) for v in pred_best_iou],
+                    "gt_best_dice": [round(float(v), 4) for v in gt_best_dice],
+                    "pred_best_dice": [round(float(v), 4) for v in pred_best_dice],
                     "gt_matched": {
                         f"{thr:g}": per_thr_match[thr][0].tolist()
-                        for thr in NODULE_IOU_THRS
+                        for thr in NODULE_DICE_THRS
                     },
                     "pred_matched": {
                         f"{thr:g}": per_thr_match[thr][1].tolist()
-                        for thr in NODULE_IOU_THRS
+                        for thr in NODULE_DICE_THRS
                     },
                 })
 
@@ -267,10 +267,10 @@ def evaluate(model, data_loader, device, args):
         print(f'  precision@{thr:.1f}: {prec:.2f}')
 
     def _format(tag: str, table: dict) -> None:
-        print(f'\nPer-nodule metrics ({tag}):')
-        print(f'  {"thr":>4} | {"TP":>5} {"FN":>5} {"FP":>5} | '
+        print(f'\nPer-nodule metrics, Dice match (tag: {tag}):')
+        print(f'  {"Dice":>4} | {"TP":>5} {"FN":>5} {"FP":>5} | '
               f'{"Recall":>7} {"Precision":>9}')
-        for thr in NODULE_IOU_THRS:
+        for thr in NODULE_DICE_THRS:
             tp, fn, fp = table[thr]
             recall = (100.0 * tp / (tp + fn)) if (tp + fn) > 0 else 0.0
             precision = (100.0 * tp / (tp + fp)) if (tp + fp) > 0 else 0.0
@@ -285,7 +285,8 @@ def evaluate(model, data_loader, device, args):
         out_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "img_size": args.img_size,
-            "thresholds": list(NODULE_IOU_THRS),
+            "match_metric": "dice",
+            "thresholds": list(NODULE_DICE_THRS),
             "slices": cc_stats_slices,
         }
         with open(out_path, "w") as f:
