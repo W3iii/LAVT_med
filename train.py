@@ -27,6 +27,10 @@ def format_input_size(args):
     return f'{img_w}x{img_h} (W x H)'
 
 
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
 def get_transform(args, is_train: bool):
     img_h, img_w = get_input_size(args)
     transforms = [
@@ -51,6 +55,7 @@ def get_transform(args, is_train: bool):
         ])
     else:
         transforms.append(T.Clip01())
+    transforms.append(T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD))
     return T.Compose(transforms)
 
 
@@ -133,6 +138,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader, lr_scheduler,
 
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         lr_scheduler.step()
 

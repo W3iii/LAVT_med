@@ -27,12 +27,17 @@ def format_input_size(args):
     return f'{img_w}x{img_h} (W x H)'
 
 
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
 def get_transform(args):
     img_h, img_w = get_input_size(args)
     return T.Compose([
         T.PadOrCropToSize(img_h, img_w, image_fill=0, target_fill=0),
         T.ToTensor(),
         T.Clip01(),
+        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ])
 
 
