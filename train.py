@@ -42,17 +42,9 @@ def get_transform(args, is_train: bool):
             T.RandomMildAffine(prob=0.5, degrees=7.0,
                                translate_px=10,
                                scale_range=(0.95, 1.05)),
-            T.RandomGaussianBlur(prob=0.1, sigma_max=0.5),
         ])
     transforms.append(T.ToTensor())
-    if is_train:
-        transforms.extend([
-            T.RandomIntensityShiftScale(shift=0.05, scale=0.1,
-                                        shift_prob=0.5,
-                                        scale_prob=0.5),
-            T.RandomGaussianNoise(prob=0.3, std=0.015),
-        ])
-    else:
+    if not is_train:
         transforms.append(T.Clip01())
     transforms.append(T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD))
     return T.Compose(transforms)
