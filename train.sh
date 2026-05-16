@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_ID=lavt_one_ln_v1_aug_geom_only
+MODEL_ID=lavt_one_ln_v1_aug_geom_noclip
 
 mkdir -p ./models/${MODEL_ID}
 mkdir -p ./checkpoints/

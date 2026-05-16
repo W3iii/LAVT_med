@@ -129,7 +129,6 @@ def train_one_epoch(model, criterion, optimizer, data_loader, lr_scheduler,
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         lr_scheduler.step()
 
