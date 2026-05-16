@@ -31,23 +31,13 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
-def get_transform(args, is_train: bool):
+def get_transform(args):
     img_h, img_w = get_input_size(args)
-    transforms = [
+    return T.Compose([
         T.Resize(img_h, img_w),
-    ]
-    if is_train:
-        transforms.extend([
-            T.RandomHorizontalFlip(0.5),
-            T.RandomMildAffine(prob=0.5, degrees=7.0,
-                               translate_px=10,
-                               scale_range=(0.95, 1.05)),
-        ])
-    transforms.append(T.ToTensor())
-    if not is_train:
-        transforms.append(T.Clip01())
-    transforms.append(T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD))
-    return T.Compose(transforms)
+        T.ToTensor(),
+        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+    ])
 
 
 def get_dataset(split, transform, args):
@@ -176,8 +166,8 @@ def main(args):
     print(f'Image size: {format_input_size(args)}')
     print(f'Distributed: {distributed}')
 
-    dataset_train = get_dataset('train', get_transform(args, is_train=True), args)
-    dataset_val = get_dataset('val', get_transform(args, is_train=False), args)
+    dataset_train = get_dataset('train', get_transform(args), args)
+    dataset_val = get_dataset('val', get_transform(args), args)
 
     if distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(
