@@ -110,33 +110,15 @@ def train_one_epoch(model, criterion, optimizer, data_loader, lr_scheduler,
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value}'))
     header = f'Epoch: [{epoch}]'
 
-    for it, (image, target) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for image, target in metric_logger.log_every(data_loader, print_freq, header):
         image = image.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
 
         logits = model(image)
         loss = criterion(logits, target)
 
-        if not torch.isfinite(loss):
-            print(f'[ep{epoch} it{it}] NaN/Inf loss detected, skipping batch')
-            optimizer.zero_grad()
-            continue
-
         optimizer.zero_grad()
         loss.backward()
-
-        if it % print_freq == 0:
-            with torch.no_grad():
-                pred = logits.argmax(dim=1)
-                pred_fg_ratio = pred.float().mean().item()
-                is_pos = target.flatten(1).any(dim=1)
-                grad_norm = sum(p.grad.detach().norm().item() ** 2
-                                for p in model.parameters() if p.grad is not None) ** 0.5
-                print(f'  [ep{epoch} it{it}] '
-                      f'pred_fg={pred_fg_ratio:.5f}  '
-                      f'pos_in_batch={int(is_pos.sum().item())}/{int(is_pos.numel())}  '
-                      f'grad_norm={grad_norm:.3f}')
-
         optimizer.step()
         lr_scheduler.step()
 
