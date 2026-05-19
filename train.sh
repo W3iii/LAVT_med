@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_ID=lavt_one_ln_v1_neg05
+MODEL_ID=lavt_one_ln_v1_augment_neg05
 
 mkdir -p ./models/${MODEL_ID}
 mkdir -p ./checkpoints/
