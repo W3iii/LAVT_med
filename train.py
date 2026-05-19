@@ -47,12 +47,11 @@ def get_transform(args, is_train: bool):
         # Noise → Blur → MultBrightness → Contrast → SimLowRes →
         # GammaInverted → Gamma → Mirror.
         transforms.extend([
-            T.RandomGaussianNoiseV2(prob=0.1, max_variance=0.1),
+            T.RandomGaussianNoiseV2(prob=0.1, max_variance=0.01),
             T.RandomGaussianBlurTensor(prob=0.2, sigma_range=(0.5, 1.0)),
             T.RandomMultiplicativeBrightness(prob=0.15,
                                              multiplier_range=(0.75, 1.25)),
             T.RandomContrast(prob=0.15, contrast_range=(0.75, 1.25)),
-            T.RandomSimulateLowResolution(prob=0.25, scale_range=(0.5, 1.0)),
             T.RandomGammaTransform(prob=0.1, gamma_range=(0.7, 1.5),
                                    invert=True, retain_stats=True),
             T.RandomGammaTransform(prob=0.3, gamma_range=(0.7, 1.5),
