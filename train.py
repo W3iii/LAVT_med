@@ -35,15 +35,11 @@ def get_transform(args, is_train: bool):
     img_h, img_w = get_input_size(args)
     transforms = [T.Resize(img_h, img_w)]
     if is_train:
-        # Geometry-only augment. Intensity augments removed — under BN
-        # they widen the train pixel-value distribution and pollute the
-        # running stats, breaking eval-mode predictions.
-        transforms.extend([
-            T.SpatialTransform2D(rotation_deg=15.0,
-                                 scaling_range=(0.7, 1.4),
-                                 p_rotation=0.2, p_scaling=0.2),
-            T.RandomHorizontalFlip(0.5),
-        ])
+        # H-flip only. Anything that introduces zero-padding (rotation,
+        # scaling) shifts BN running stats toward the "more-zeros" mean
+        # and breaks eval predictions; pure reflection keeps the pixel
+        # distribution identical.
+        transforms.append(T.RandomHorizontalFlip(0.5))
     transforms.append(T.ToTensor())
     transforms.append(T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD))
     return T.Compose(transforms)
