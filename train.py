@@ -16,33 +16,12 @@ import transforms as T
 import utils
 
 
-def get_input_size(args):
-    if args.img_size is not None:
-        return args.img_size, args.img_size
-    return args.img_h, args.img_w
-
-
-def format_input_size(args):
-    img_h, img_w = get_input_size(args)
-    return f'{img_w}x{img_h} (W x H)'
-
-
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
-
-
-def get_transform(args, is_train: bool):
-    img_h, img_w = get_input_size(args)
-    transforms = [T.Resize(img_h, img_w)]
-    if is_train:
-        # H-flip only. Anything that introduces zero-padding (rotation,
-        # scaling) shifts BN running stats toward the "more-zeros" mean
-        # and breaks eval predictions; pure reflection keeps the pixel
-        # distribution identical.
-        transforms.append(T.RandomHorizontalFlip(0.5))
-    transforms.append(T.ToTensor())
-    transforms.append(T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD))
-    return T.Compose(transforms)
+def get_transform(args):
+    return T.Compose([
+        T.Resize(args.img_size, args.img_size),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
 
 
 def get_dataset(split, transform, args):
@@ -168,11 +147,11 @@ def main(args):
         if args.model_id:
             utils.mkdir(os.path.join('./models/', args.model_id))
 
-    print(f'Image size: {format_input_size(args)}')
+    print(f'Image size: {args.img_size}')
     print(f'Distributed: {distributed}')
 
-    dataset_train = get_dataset('train', get_transform(args, is_train=True), args)
-    dataset_val = get_dataset('val', get_transform(args, is_train=False), args)
+    dataset_train = get_dataset('train', get_transform(args), args)
+    dataset_val = get_dataset('val', get_transform(args), args)
 
     if distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -227,7 +206,7 @@ def main(args):
     else:
         resume_epoch = -1
 
-    criterion = FocalDiceLoss(gamma=2.0, alpha=0.9, neg_weight=0.1).cuda()
+    criterion = FocalDiceLoss(gamma=2.0, alpha=0.9, neg_weight=0.2).cuda()
 
     start_time = time.time()
     best_overall_iou = -1.0
