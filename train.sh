@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_ID=lavt_one_ln_v1_neg05
+MODEL_ID=lavt_one_ln_v2_nnunetstyle
 
 mkdir -p ./models/${MODEL_ID}
 mkdir -p ./checkpoints/
@@ -24,6 +24,8 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
     --pin_mem \
     --output-dir ./checkpoints/${MODEL_ID} \
     --neg_ratio 0.5 \
+    --fg_fraction 0.333 \
+    --batch_dice \
     --n_soft_tokens 6 \
     --seed 42 \
     2>&1 | tee ./models/${MODEL_ID}/output

@@ -32,6 +32,12 @@ def get_parser():
     parser.add_argument('--model_id', default='lavt_one', help='name to identify the model')
     parser.add_argument('--neg_ratio', default=0.1, type=float,
                         help='negative-to-positive sampling ratio per epoch')
+    parser.add_argument('--fg_fraction', default=1/3, type=float,
+                        help='minimum fraction of each batch that must be positive samples '
+                             '(nnUNet-style foreground guarantee); 0 disables')
+    parser.add_argument('--batch_dice', action='store_true',
+                        help='compute Dice over the whole batch instead of per-sample '
+                             '(nnUNet-style; better gradient for small nodules)')
     parser.add_argument('--n_soft_tokens', default=4, type=int,
                         help='number of learnable soft prompt tokens')
     parser.add_argument('--output-dir', default='./checkpoints/', help='path where to save checkpoint weights')

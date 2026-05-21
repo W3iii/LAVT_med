@@ -163,7 +163,8 @@ def main(args):
     else:
         train_sampler = PatientAwareBatchSampler(
             dataset_train, batch_size=args.batch_size,
-            drop_last=True, shuffle=True, seed=args.seed)
+            drop_last=True, shuffle=True, seed=args.seed,
+            fg_fraction=args.fg_fraction)
         data_loader_train = torch.utils.data.DataLoader(
             dataset_train, batch_sampler=train_sampler,
             num_workers=args.workers, pin_memory=args.pin_mem)
@@ -206,7 +207,8 @@ def main(args):
     else:
         resume_epoch = -1
 
-    criterion = FocalDiceLoss(gamma=2.0, alpha=0.9, neg_weight=0.2).cuda()
+    criterion = FocalDiceLoss(gamma=2.0, alpha=0.9, neg_weight=0.2,
+                              batch_dice=args.batch_dice).cuda()
 
     start_time = time.time()
     best_overall_iou = -1.0
