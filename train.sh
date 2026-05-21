@@ -19,11 +19,12 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
     --pretrained_swin_weights ./pretrained_weights/swin_base_patch4_window12_384_22k.pth \
     --window12 \
     --epochs 100 \
-    --img_size 512 \
+    --img_h 288 \
+    --img_w 384 \
     --workers 4 \
     --pin_mem \
     --output-dir ./checkpoints/${MODEL_ID} \
-    --neg_ratio 0.5 \
+    --neg_ratio 1.0 \
     --fg_fraction 0.333 \
     --batch_dice \
     --n_soft_tokens 6 \
