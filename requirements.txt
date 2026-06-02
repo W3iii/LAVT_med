@@ -8,6 +8,6 @@ ftfy
 regex
 scipy
 scikit-image
-opencv-python==4.5.3.56
-tokenizers==0.8.1rc1
+opencv-python-headless
+tokenizers
 h5py
