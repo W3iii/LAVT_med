@@ -2,8 +2,8 @@ requests
 filelock
 tqdm
 timm
-mmcv-full==1.3.12
-mmsegmentation==0.17.0
+#mmcv-full==1.3.12
+#mmsegmentation==0.17.0
 ftfy
 regex
 scipy
