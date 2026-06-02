@@ -4,6 +4,60 @@ from torch.nn import functional as F
 from collections import OrderedDict
 
 
+# ---------------------------------------------------------------------------
+# nnUNet-style decoder
+# ---------------------------------------------------------------------------
+
+class _ConvNormAct(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=True),
+            nn.InstanceNorm2d(out_ch, eps=1e-5, affine=True),
+            nn.LeakyReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class NnUNetDecoding(nn.Module):
+    """
+    nnUNet-style top-down decoder (InstanceNorm + LeakyReLU).
+
+    Each decode stage: bilinear upsample → concat skip → 2× ConvNormAct.
+
+    Args:
+        c4, c3, c2, c1: encoder output channels (coarse→fine).
+        n_conv_per_stage: conv blocks per decode stage (default 2).
+    """
+
+    def __init__(self, c4, c3, c2, c1, n_conv_per_stage=2):
+        super().__init__()
+
+        def _stage(in_ch, out_ch):
+            layers = [_ConvNormAct(in_ch, out_ch)]
+            for _ in range(n_conv_per_stage - 1):
+                layers.append(_ConvNormAct(out_ch, out_ch))
+            return nn.Sequential(*layers)
+
+        self.dec43 = _stage(c4 + c3, c3)   # after up(c4) + cat(c3)
+        self.dec32 = _stage(c3 + c2, c2)   # after up     + cat(c2)
+        self.dec21 = _stage(c2 + c1, c1)   # after up     + cat(c1)
+        self.seg_head = nn.Conv2d(c1, 2, 1)
+
+    @staticmethod
+    def _up_cat(x, skip):
+        x = F.interpolate(x, size=skip.shape[-2:], mode='bilinear', align_corners=False)
+        return torch.cat([x, skip], dim=1)
+
+    def forward(self, x_c4, x_c3, x_c2, x_c1):
+        x = self.dec43(self._up_cat(x_c4, x_c3))
+        x = self.dec32(self._up_cat(x,    x_c2))
+        x = self.dec21(self._up_cat(x,    x_c1))
+        return self.seg_head(x)
+
+
 class SimpleDecoding(nn.Module):
     def __init__(self, c4_dims, factor=2):
         super(SimpleDecoding, self).__init__()

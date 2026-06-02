@@ -19,11 +19,12 @@ import utils
 def get_transform(args):
     h = args.img_h if args.img_size is None else args.img_size
     w = args.img_w if args.img_size is None else args.img_size
-    return T.Compose([
-        T.Resize(h, w),
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    transforms = [T.Resize(h, w), T.ToTensor()]
+    if getattr(args, 'backbone', 'swin') != 'nnunet':
+        transforms.append(
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        )
+    return T.Compose(transforms)
 
 
 def get_dataset(split, transform, args):

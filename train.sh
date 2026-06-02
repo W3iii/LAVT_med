@@ -1,23 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_ID=lavt_one_ln_v2_nnunetstyle
+MODEL_ID=lavt_one_ln_nnunet_backbone
 
 mkdir -p ./models/${MODEL_ID}
 mkdir -p ./checkpoints/
 
 CUDA_VISIBLE_DEVICES=0 python train.py \
     --model lavt_one \
+    --backbone nnunet \
     --model_id ${MODEL_ID} \
     --bert_tokenizer ./pretrained_weights/biobert-base-cased-v1.2 \
     --ck_bert ./pretrained_weights/biobert-base-cased-v1.2 \
-    --data_root ../../groups/BME/LN_dataset_2D_vlm_2classes_neg10 \
+    --data_root ../../groups/BME/LN_dataset_2D_vlm_npy_2classes_neg10 \
     --batch-size 32 \
-    --lr 0.000025 \
+    --lr 0.0001 \
     --wd 1e-2 \
-    --swin_type base \
-    --pretrained_swin_weights ./pretrained_weights/swin_base_patch4_window12_384_22k.pth \
-    --window12 \
     --epochs 100 \
     --img_h 288 \
     --img_w 384 \

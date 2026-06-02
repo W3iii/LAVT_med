@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
-from .mask_predictor import SimpleDecoding
+from .mask_predictor import SimpleDecoding, NnUNetDecoding
 from .backbone import MultiModalSwinTransformer
+from .nnunet_backbone import MultiModalNnUNetBackbone
 from ._utils import LAVT, LAVTOne
 
 __all__ = ['lavt', 'lavt_one']
@@ -140,4 +141,28 @@ def _load_model_lavt_one(pretrained, args):
 
 
 def lavt_one(pretrained='', args=None):
+    if getattr(args, 'backbone', 'swin') == 'nnunet':
+        return _segm_lavt_nnunet_one(args)
     return _load_model_lavt_one(pretrained, args)
+
+
+# ------------------------------------------------------------------
+# nnUNet backbone variant
+# ------------------------------------------------------------------
+
+def _segm_lavt_nnunet_one(args):
+    if args.mha:
+        mha = tuple(int(a) for a in args.mha.split('-'))
+    else:
+        mha = (1, 1, 1, 1)
+
+    backbone = MultiModalNnUNetBackbone(
+        in_chans=1,
+        num_heads_fusion=mha,
+        fusion_drop=args.fusion_drop,
+    )
+
+    c1, c2, c3, c4 = backbone.out_channels   # 128, 256, 512, 512
+    classifier = NnUNetDecoding(c4, c3, c2, c1)
+    model = LAVTOne(backbone, classifier, args)
+    return model

@@ -2,6 +2,7 @@ import json
 import random
 from pathlib import Path
 
+import numpy as np
 import torch.utils.data as data
 from PIL import Image
 
@@ -65,7 +66,12 @@ class LungNoduleDataset(data.Dataset):
 
     def __getitem__(self, idx: int):
         ann = self.samples[idx]
-        img = Image.open(self.images_dir / ann["image"]).convert("RGB")
+        img_path = self.images_dir / ann["image"]
+        if img_path.suffix == ".npy":
+            arr = np.load(img_path).astype(np.float32)  # (H, W) CTNorm float
+            img = Image.fromarray(arr, mode="F")
+        else:
+            img = Image.open(img_path).convert("RGB")
         if ann["mask"] == "empty":
             target = Image.new("L", img.size, 0)
         else:

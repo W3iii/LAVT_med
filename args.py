@@ -3,6 +3,8 @@ import argparse
 
 def get_parser():
     parser = argparse.ArgumentParser(description='LAVT training and testing')
+    parser.add_argument('--backbone', default='swin', choices=['swin', 'nnunet'],
+                        help='visual backbone: swin (default) or nnunet (PlainConvEncoder)')
     parser.add_argument('--amsgrad', action='store_true',
                         help='if true, set amsgrad to True in an Adam or AdamW optimizer.')
     parser.add_argument('-b', '--batch-size', default=8, type=int)
