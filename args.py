@@ -48,6 +48,17 @@ def get_parser():
     parser.add_argument('--cc_stats_json', default='',
                         help='if set, test.py writes per-slice CC sizes + TP/FP labels '
                              'to this JSON path for downstream FP-size analysis')
+    parser.add_argument('--froc_json', default='',
+                        help='if set, test.py writes FROC curve data (sensitivity vs FP/image) '
+                             'to this JSON path')
+    parser.add_argument('--froc_plot', default='',
+                        help='if set, test.py saves a FROC curve figure (PNG) to this path')
+    parser.add_argument('--size_plot', default='',
+                        help='if set, test.py saves a size-stratified recall figure (PNG) to this path')
+    parser.add_argument('--froc_match_dice', default=0.1, type=float,
+                        help='Dice threshold to count a predicted CC as TP in FROC (default 0.1)')
+    parser.add_argument('--froc_extract_thr', default=0.05, type=float,
+                        help='softmax probability threshold for extracting candidate CCs in FROC (default 0.05)')
     parser.add_argument('--pin_mem', action='store_true',
                         help='If true, pin memory when using the data loader.')
     parser.add_argument('--pretrained_swin_weights', default='',

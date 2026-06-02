@@ -30,6 +30,29 @@ class Resize(object):
         return image, target
 
 
+class ResizeWithPad(object):
+    """Resize maintaining aspect ratio, then zero-pad to exactly (h, w)."""
+    def __init__(self, h, w):
+        self.h = h
+        self.w = w
+
+    def __call__(self, image, target):
+        orig_w, orig_h = image.size          # PIL size is (W, H)
+        scale = min(self.h / orig_h, self.w / orig_w)
+        new_h = int(round(orig_h * scale))
+        new_w = int(round(orig_w * scale))
+
+        image  = F.resize(image,  (new_h, new_w))
+        target = F.resize(target, (new_h, new_w), interpolation=Image.NEAREST)
+
+        pad_h = self.h - new_h              # pad bottom
+        pad_w = self.w - new_w              # pad right
+        # F.pad order: (left, top, right, bottom)
+        image  = F.pad(image,  (0, 0, pad_w, pad_h), fill=0)
+        target = F.pad(target, (0, 0, pad_w, pad_h), fill=0)
+        return image, target
+
+
 class RandomResize(object):
     def __init__(self, min_size, max_size=None):
         self.min_size = min_size
