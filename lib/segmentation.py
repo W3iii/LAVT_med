@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 from .mask_predictor import SimpleDecoding, NnUNetDecoding
-from .backbone import MultiModalSwinTransformer
 from .nnunet_backbone import MultiModalNnUNetBackbone
 from ._utils import LAVT, LAVTOne
 
@@ -10,7 +9,7 @@ __all__ = ['lavt', 'lavt_one']
 
 # LAVT
 def _segm_lavt(pretrained, args):
-    # initialize the SwinTransformer backbone with the specified version
+    from .backbone import MultiModalSwinTransformer
     if args.swin_type == 'tiny':
         embed_dim = 96
         depths = [2, 2, 6, 2]
@@ -79,7 +78,7 @@ def lavt(pretrained='', args=None):
 # LAVT One: put BERT inside the overall model #
 ###############################################
 def _segm_lavt_one(pretrained, args):
-    # initialize the SwinTransformer backbone with the specified version
+    from .backbone import MultiModalSwinTransformer
     if args.swin_type == 'tiny':
         embed_dim = 96
         depths = [2, 2, 6, 2]
