@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from .backbone import PWAM
+from .fusion import PWAM
 
 
 class ConvNormAct(nn.Module):
