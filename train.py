@@ -4,11 +4,13 @@ import time
 from functools import reduce
 import operator
 
+import numpy as np
 import torch
 import torch.utils.data
+from scipy.ndimage import label as cc_label
 
 from lib import segmentation
-from lib.loss import FocalDiceLoss
+from lib.loss import FocalDiceLoss, DeepSupervisionLoss
 from data.dataset_lung_nodule import LungNoduleDataset
 from data.sampler import PatientAwareBatchSampler
 
@@ -16,10 +18,23 @@ import transforms as T
 import utils
 
 
-def get_transform(args):
+def get_transform(args, is_train=False):
     h = args.img_h if args.img_size is None else args.img_size
     w = args.img_w if args.img_size is None else args.img_size
-    transforms = [T.Resize(h, w), T.ToTensor()]
+    transforms = [T.Resize(h, w)]
+    if is_train:
+        transforms += [
+            T.RandomFlip(p=0.5),
+            T.RandomVerticalFlip(p=0.5),
+            T.RandomRotation(degrees=30, p=0.5),
+            T.RandomScaleAndCrop(scale_range=(0.85, 1.25), p=0.5),
+        ]
+    transforms.append(T.ToTensor())
+    if is_train:
+        transforms += [
+            T.GaussianNoise(std_range=(0.0, 0.1), p=0.15),
+            T.GammaAugmentation(gamma_range=(0.7, 1.5), p=0.3),
+        ]
     if getattr(args, 'backbone', 'swin') != 'nnunet':
         transforms.append(
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -37,6 +52,41 @@ def get_dataset(split, transform, args):
     )
 
 
+_CC_THRS = (0.3, 0.5)
+
+
+def _cc_pr_counts(pred_mask: np.ndarray, gt_mask: np.ndarray):
+    """
+    Per-slice CC-level matching.  For each GT CC and each pred CC, find the
+    best Dice against any overlapping CC on the other side.
+
+    Returns:
+        best_gt   (n_gt,)   – best Dice each GT CC achieved against pred
+        best_pred (n_pred,) – best Dice each pred CC achieved against GT
+    """
+    pred_cc, n_pred = cc_label(pred_mask)
+    gt_cc,   n_gt   = cc_label(gt_mask)
+
+    best_gt   = np.zeros(n_gt,   dtype=np.float32)
+    best_pred = np.zeros(n_pred, dtype=np.float32)
+
+    for g in range(1, n_gt + 1):
+        gt_g    = gt_cc == g
+        gt_sum  = int(gt_g.sum())
+        for p in np.unique(pred_cc[gt_g]):
+            if p == 0:
+                continue
+            pred_p = pred_cc == p
+            inter  = int((pred_p & gt_g).sum())
+            d      = 2 * inter / (int(pred_p.sum()) + gt_sum)
+            if d > best_gt[g - 1]:
+                best_gt[g - 1] = d
+            if d > best_pred[p - 1]:
+                best_pred[p - 1] = d
+
+    return best_gt, best_pred
+
+
 @torch.no_grad()
 def evaluate(model, data_loader):
     model.eval()
@@ -48,29 +98,41 @@ def evaluate(model, data_loader):
     cum_union = torch.zeros((), dtype=torch.float64, device='cuda')
     n_pos = 0
     n_neg = 0
-    n_tn = 0
+    n_tn  = 0
+    # CC nodule-level counters: gt_hits, n_gt, pred_hits, n_pred
+    cc_counts = {thr: [0, 0, 0, 0] for thr in _CC_THRS}
 
     for image, target in metric_logger.log_every(data_loader, 100, header):
-        image = image.cuda(non_blocking=True)
+        image  = image.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)        # (B, H, W) {0, 1}
 
         logits = model(image)                          # (B, 2, H, W)
-        pred = logits.argmax(dim=1)                    # (B, H, W) {0, 1}
+        pred   = logits.argmax(dim=1)                  # (B, H, W) {0, 1}
 
         target_flat = target.flatten(1)
-        pred_flat = pred.flatten(1)
+        pred_flat   = pred.flatten(1)
         is_pos = target_flat.any(dim=1)                # (B,) bool
 
         inter = (pred_flat * target_flat).sum(dim=1).double()
         union = (pred_flat.sum(dim=1) + target_flat.sum(dim=1)).double() - inter
-        iou = torch.where(union > 0, inter / union, torch.zeros_like(inter))
+        iou   = torch.where(union > 0, inter / union, torch.zeros_like(inter))
 
         if is_pos.any():
-            iou_pos = iou[is_pos]
-            iou_chunks.append(iou_pos.cpu())
+            iou_chunks.append(iou[is_pos].cpu())
             cum_inter += inter[is_pos].sum()
             cum_union += union[is_pos].sum()
             n_pos += int(is_pos.sum().item())
+
+            pred_np = pred[is_pos].cpu().numpy().astype(bool)
+            gt_np   = target[is_pos].cpu().numpy().astype(bool)
+            for ps, gs in zip(pred_np, gt_np):
+                best_gt, best_pred = _cc_pr_counts(ps, gs)
+                for thr in _CC_THRS:
+                    c = cc_counts[thr]
+                    c[0] += int((best_gt   >= thr).sum())
+                    c[1] += len(best_gt)
+                    c[2] += int((best_pred >= thr).sum())
+                    c[3] += len(best_pred)
 
         neg_mask = ~is_pos
         if neg_mask.any():
@@ -78,14 +140,19 @@ def evaluate(model, data_loader):
             n_tn += int((pred_neg_sum == 0).sum().item())
             n_neg += int(neg_mask.sum().item())
 
-    mean_iou = (torch.cat(iou_chunks).mean().item() if iou_chunks else 0.0) * 100.0
+    mean_iou    = (torch.cat(iou_chunks).mean().item() if iou_chunks else 0.0) * 100.0
     overall_iou = (cum_inter / cum_union).item() * 100.0 if cum_union.item() > 0 else 0.0
-    tn_rate = (n_tn / n_neg) * 100.0 if n_neg > 0 else 0.0
+    tn_rate     = (n_tn / n_neg) * 100.0 if n_neg > 0 else 0.0
 
-    print(f'Final results:')
+    print('Final results:')
     print(f'  Mean IoU:    {mean_iou:.2f}  ({n_pos} positive samples)')
     print(f'  Overall IoU: {overall_iou:.2f}')
     print(f'  TN rate:     {tn_rate:.2f}  ({n_tn}/{n_neg} negatives all-zero)')
+    for thr in _CC_THRS:
+        gh, ng, ph, np_ = cc_counts[thr]
+        rec  = gh / ng   * 100.0 if ng   > 0 else 0.0
+        prec = ph / np_  * 100.0 if np_  > 0 else 0.0
+        print(f'  Nodule Dice>{thr:.1f}: P={prec:.1f}% ({ph}/{np_})  R={rec:.1f}% ({gh}/{ng})')
 
     return mean_iou, overall_iou, tn_rate
 
@@ -153,8 +220,8 @@ def main(args):
     print(f'Image size: {args.img_size}')
     print(f'Distributed: {distributed}')
 
-    dataset_train = get_dataset('train', get_transform(args), args)
-    dataset_val = get_dataset('val', get_transform(args), args)
+    dataset_train = get_dataset('train', get_transform(args, is_train=True), args)
+    dataset_val   = get_dataset('val',   get_transform(args, is_train=False), args)
 
     if distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -210,8 +277,9 @@ def main(args):
     else:
         resume_epoch = -1
 
-    criterion = FocalDiceLoss(gamma=2.0, alpha=0.9, neg_weight=0.2,
-                              batch_dice=args.batch_dice).cuda()
+    criterion = DeepSupervisionLoss(
+        FocalDiceLoss(gamma=2.0, alpha=0.9, batch_dice=args.batch_dice)
+    ).cuda()
 
     start_time = time.time()
     best_overall_iou = -1.0

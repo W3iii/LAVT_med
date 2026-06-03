@@ -40,6 +40,9 @@ def get_parser():
     parser.add_argument('--batch_dice', action='store_true',
                         help='compute Dice over the whole batch instead of per-sample '
                              '(nnUNet-style; better gradient for small nodules)')
+    parser.add_argument('--deep_supervision', action='store_true',
+                        help='enable nnU-Net style deep supervision in the decoder '
+                             '(auxiliary seg heads at ½ and ¼ resolution, weights 1/0.5/0.25)')
     parser.add_argument('--n_soft_tokens', default=4, type=int,
                         help='number of learnable soft prompt tokens')
     parser.add_argument('--output-dir', default='./checkpoints/', help='path where to save checkpoint weights')

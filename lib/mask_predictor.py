@@ -30,10 +30,15 @@ class NnUNetDecoding(nn.Module):
     Args:
         c4, c3, c2, c1: encoder output channels (coarse→fine).
         n_conv_per_stage: conv blocks per decode stage (default 2).
+        deep_supervision: if True, return [logit_c1, logit_c2, logit_c3]
+            during training (weights 1, 0.5, 0.25 applied by the loss).
+            At eval time always returns the single full-res logit.
     """
 
-    def __init__(self, c4, c3, c2, c1, n_conv_per_stage=2):
+    def __init__(self, c4, c3, c2, c1, n_conv_per_stage=2,
+                 deep_supervision=False):
         super().__init__()
+        self.deep_supervision = deep_supervision
 
         def _stage(in_ch, out_ch):
             layers = [_ConvNormAct(in_ch, out_ch)]
@@ -41,10 +46,14 @@ class NnUNetDecoding(nn.Module):
                 layers.append(_ConvNormAct(out_ch, out_ch))
             return nn.Sequential(*layers)
 
-        self.dec43 = _stage(c4 + c3, c3)   # after up(c4) + cat(c3)
-        self.dec32 = _stage(c3 + c2, c2)   # after up     + cat(c2)
-        self.dec21 = _stage(c2 + c1, c1)   # after up     + cat(c1)
+        self.dec43 = _stage(c4 + c3, c3)
+        self.dec32 = _stage(c3 + c2, c2)
+        self.dec21 = _stage(c2 + c1, c1)
         self.seg_head = nn.Conv2d(c1, 2, 1)
+
+        if deep_supervision:
+            self.seg_head_ds2 = nn.Conv2d(c2, 2, 1)   # after dec32 (½ res)
+            self.seg_head_ds3 = nn.Conv2d(c3, 2, 1)   # after dec43 (¼ res)
 
     @staticmethod
     def _up_cat(x, skip):
@@ -52,10 +61,14 @@ class NnUNetDecoding(nn.Module):
         return torch.cat([x, skip], dim=1)
 
     def forward(self, x_c4, x_c3, x_c2, x_c1):
-        x = self.dec43(self._up_cat(x_c4, x_c3))
-        x = self.dec32(self._up_cat(x,    x_c2))
-        x = self.dec21(self._up_cat(x,    x_c1))
-        return self.seg_head(x)
+        x43 = self.dec43(self._up_cat(x_c4, x_c3))
+        x32 = self.dec32(self._up_cat(x43,  x_c2))
+        x21 = self.dec21(self._up_cat(x32,  x_c1))
+        out = self.seg_head(x21)
+
+        if self.deep_supervision and self.training:
+            return [out, self.seg_head_ds2(x32), self.seg_head_ds3(x43)]
+        return out
 
 
 class SimpleDecoding(nn.Module):

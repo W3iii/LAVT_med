@@ -162,6 +162,7 @@ def _segm_lavt_nnunet_one(args):
     )
 
     c1, c2, c3, c4 = backbone.out_channels   # 128, 256, 512, 512
-    classifier = NnUNetDecoding(c4, c3, c2, c1)
+    classifier = NnUNetDecoding(c4, c3, c2, c1,
+                                deep_supervision=getattr(args, 'deep_supervision', False))
     model = LAVTOne(backbone, classifier, args)
     return model

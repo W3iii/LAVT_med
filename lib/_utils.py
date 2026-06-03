@@ -128,13 +128,21 @@ class _LAVTOneSimpleDecode(nn.Module):
         input_shape = x.shape[-2:]
         l_feats, l_mask = self._get_language_features(x.shape[0])
         l_feats = l_feats.permute(0, 2, 1)                  # (B, 768, L)
-        l_mask = l_mask.unsqueeze(-1)                       # (B, L, 1)
+        l_mask  = l_mask.unsqueeze(-1)                      # (B, L, 1)
         features = self.backbone(x, l_feats, l_mask)
         x_c1, x_c2, x_c3, x_c4 = features
         out = self.classifier(x_c4, x_c3, x_c2, x_c1)
-        out = F.interpolate(out, size=input_shape,
-                            mode='bilinear', align_corners=True)
-        return out
+
+        if isinstance(out, list):
+            # Deep supervision: upsample only the primary (index 0) output to
+            # full resolution; DS outputs stay at their native decoder resolution
+            # so the loss can downsample the target to match them.
+            out[0] = F.interpolate(out[0], size=input_shape,
+                                   mode='bilinear', align_corners=True)
+            return out
+
+        return F.interpolate(out, size=input_shape,
+                             mode='bilinear', align_corners=True)
 
 
 class LAVTOne(_LAVTOneSimpleDecode):

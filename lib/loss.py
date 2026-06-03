@@ -7,55 +7,41 @@ class FocalDiceLoss(nn.Module):
     """
     Focal + Dice on softmax channel 1 (foreground).
 
-    batch_dice=True  (nnUNet-style, default):
-      Dice is computed over ALL positive samples in the batch as one pool.
-      Inter and denom are accumulated across samples before dividing, so
-      tiny nodules contribute proportionally instead of being drowned by
-      the smooth term in per-sample Dice.
+    All samples (positive and negative) are treated equally — same as
+    nnU-Net's CE+Dice approach.  Focal loss covers all pixels; Dice is
+    computed only over positive samples (those with at least one fg pixel).
 
-    batch_dice=False (original behaviour):
-      Dice computed per sample, then averaged — can collapse to near-zero
-      gradient for small nodules.
-
-    Per-sample focal loss is always computed (positive + negative).
-    Final loss = (focal_pos + dice_pos).mean() + neg_weight * focal_neg.mean()
+    batch_dice=True (nnUNet-style): Dice accumulated across all positive
+    samples as one pool before dividing — prevents tiny nodules from being
+    dominated by the smoothing term.
     """
 
     def __init__(self, gamma: float = 2.0, alpha: float = 0.75,
-                 neg_weight: float = 0.5, smooth: float = 1.0,
-                 batch_dice: bool = True):
+                 smooth: float = 1.0, batch_dice: bool = True):
         super().__init__()
         self.gamma = gamma
         self.alpha = alpha
-        self.neg_weight = neg_weight
         self.smooth = smooth
         self.batch_dice = batch_dice
 
     def _per_sample_focal(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # logits: (B, 2, H, W); target: (B, H, W) in {0, 1}
         log_prob = F.log_softmax(logits, dim=1)
         prob = log_prob.exp()
-
         target_oh = F.one_hot(target, num_classes=2).permute(0, 3, 1, 2).float()
-        pt = (prob * target_oh).sum(dim=1)            # (B, H, W)
-        log_pt = (log_prob * target_oh).sum(dim=1)    # (B, H, W)
-
+        pt     = (prob     * target_oh).sum(dim=1)
+        log_pt = (log_prob * target_oh).sum(dim=1)
         alpha_t = target_oh[:, 1] * self.alpha + target_oh[:, 0] * (1.0 - self.alpha)
         focal = -alpha_t * (1.0 - pt).pow(self.gamma) * log_pt
         return focal.mean(dim=(1, 2))                 # (B,)
 
     def _dice_loss(self, logits: torch.Tensor, target: torch.Tensor,
                    is_pos: torch.Tensor) -> torch.Tensor:
-        """Returns scalar Dice loss over positive samples."""
         if not is_pos.any():
-            return logits.sum() * 0.0                 # zero with grad
-
-        prob_fg = F.softmax(logits, dim=1)[:, 1]     # (B, H, W)
-
+            return logits.sum() * 0.0
+        prob_fg = F.softmax(logits, dim=1)[:, 1]
         if self.batch_dice:
-            # Accumulate inter/denom across all positive samples before dividing.
-            prob_pos = prob_fg[is_pos]                # (n_pos, H, W)
-            tgt_pos = target[is_pos].float()
+            prob_pos = prob_fg[is_pos]
+            tgt_pos  = target[is_pos].float()
             inter = (prob_pos * tgt_pos).sum()
             denom = prob_pos.sum() + tgt_pos.sum()
             return 1.0 - (2.0 * inter + self.smooth) / (denom + self.smooth)
@@ -63,16 +49,46 @@ class FocalDiceLoss(nn.Module):
             target_f = target.float()
             inter = (prob_fg * target_f).sum(dim=(1, 2))
             denom = prob_fg.sum(dim=(1, 2)) + target_f.sum(dim=(1, 2))
-            dice = (2.0 * inter + self.smooth) / (denom + self.smooth)
+            dice  = (2.0 * inter + self.smooth) / (denom + self.smooth)
             return (1.0 - dice[is_pos]).mean()
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        is_pos = target.flatten(1).any(dim=1)         # (B,) bool
-        focal = self._per_sample_focal(logits, target)
+        is_pos = target.flatten(1).any(dim=1)
+        return self._per_sample_focal(logits, target).mean() + \
+               self._dice_loss(logits, target, is_pos)
 
-        terms = []
-        if is_pos.any():
-            terms.append(focal[is_pos].mean() + self._dice_loss(logits, target, is_pos))
-        if (~is_pos).any():
-            terms.append(self.neg_weight * focal[~is_pos].mean())
-        return sum(terms)
+
+class DeepSupervisionLoss(nn.Module):
+    """
+    Wraps a per-scale criterion for nnU-Net-style deep supervision.
+
+    During training the model returns a list of logits
+    [full_res, half_res, quarter_res] (coarsest first in the list means
+    the first element is already upsampled to the target; subsequent
+    elements are at 1/2 and 1/4 of target resolution).
+
+    weights default to nnU-Net's (1, 0.5, 0.25) — unnormalised is fine
+    because they just scale gradient magnitude, not the loss value itself.
+    """
+
+    def __init__(self, criterion, weights=(1.0, 0.5, 0.25)):
+        super().__init__()
+        self.criterion = criterion
+        self.weights   = weights
+
+    def forward(self, outputs, target):
+        if not isinstance(outputs, list):
+            return self.criterion(outputs, target)
+
+        total = outputs[0].new_zeros(())
+        for w, logit in zip(self.weights, outputs):
+            h, w_sz = logit.shape[-2:]
+            if (h, w_sz) != target.shape[-2:]:
+                # max-pool preserves any foreground pixel in the window
+                t = F.adaptive_max_pool2d(
+                    target.unsqueeze(1).float(), (h, w_sz)
+                ).squeeze(1).long()
+            else:
+                t = target
+            total = total + w * self.criterion(logit, t)
+        return total

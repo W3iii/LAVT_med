@@ -135,3 +135,109 @@ class Normalize(object):
         image = F.normalize(image, mean=self.mean, std=self.std)
         return image, target
 
+
+# ---------------------------------------------------------------------------
+# nnU-Net style augmentations
+# ---------------------------------------------------------------------------
+
+class RandomFlip(object):
+    """Random horizontal flip."""
+    def __init__(self, p=0.5):
+        self.p = p
+
+    def __call__(self, image, target):
+        if random.random() < self.p:
+            image  = F.hflip(image)
+            target = F.hflip(target)
+        return image, target
+
+
+class RandomVerticalFlip(object):
+    def __init__(self, p=0.5):
+        self.p = p
+
+    def __call__(self, image, target):
+        if random.random() < self.p:
+            image  = F.vflip(image)
+            target = F.vflip(target)
+        return image, target
+
+
+class RandomRotation(object):
+    """Random rotation ±degrees."""
+    def __init__(self, degrees=30, p=0.5):
+        self.degrees = degrees
+        self.p = p
+
+    def __call__(self, image, target):
+        if random.random() < self.p:
+            angle = random.uniform(-self.degrees, self.degrees)
+            image  = F.rotate(image,  angle, fill=0)
+            target = F.rotate(target, angle, interpolation=Image.NEAREST, fill=0)
+        return image, target
+
+
+class RandomScaleAndCrop(object):
+    """
+    Scale by a random factor then resize back to original size.
+    scale > 1 → zoom in (random crop back).
+    scale < 1 → zoom out (resize back, nodule appears smaller in frame).
+    """
+    def __init__(self, scale_range=(0.85, 1.25), p=0.5):
+        self.lo, self.hi = scale_range
+        self.p = p
+
+    def __call__(self, image, target):
+        if random.random() >= self.p:
+            return image, target
+
+        w0, h0 = image.size          # PIL (W, H)
+        scale  = random.uniform(self.lo, self.hi)
+        new_h  = int(round(h0 * scale))
+        new_w  = int(round(w0 * scale))
+
+        image  = F.resize(image,  (new_h, new_w))
+        target = F.resize(target, (new_h, new_w), interpolation=Image.NEAREST)
+
+        if new_h >= h0 and new_w >= w0:
+            top  = random.randint(0, new_h - h0)
+            left = random.randint(0, new_w - w0)
+            image  = F.crop(image,  top, left, h0, w0)
+            target = F.crop(target, top, left, h0, w0)
+        else:
+            image  = F.resize(image,  (h0, w0))
+            target = F.resize(target, (h0, w0), interpolation=Image.NEAREST)
+
+        return image, target
+
+
+class GaussianNoise(object):
+    """Add Gaussian noise to the image tensor; leaves the mask unchanged."""
+    def __init__(self, std_range=(0.0, 0.1), p=0.15):
+        self.lo, self.hi = std_range
+        self.p = p
+
+    def __call__(self, image, target):
+        if random.random() < self.p:
+            std   = random.uniform(self.lo, self.hi)
+            image = image + torch.randn_like(image) * std
+        return image, target
+
+
+class GammaAugmentation(object):
+    """
+    Gamma correction: shift to [0,1], apply x^gamma, shift back.
+    Works for both z-score CT floats and [0,1] RGB tensors.
+    """
+    def __init__(self, gamma_range=(0.7, 1.5), p=0.3):
+        self.lo, self.hi = gamma_range
+        self.p = p
+
+    def __call__(self, image, target):
+        if random.random() < self.p:
+            gamma = random.uniform(self.lo, self.hi)
+            mn  = image.min()
+            rng = (image.max() - mn).clamp(min=1e-8)
+            image = ((image - mn) / rng).pow(gamma) * rng + mn
+        return image, target
+
